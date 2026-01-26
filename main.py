@@ -65,6 +65,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         ch = res[0]
+        import json
+        await update.message.reply_text(
+            "SEARCH RESPONSE:\n" + json.dumps(ch, ensure_ascii=False, indent=2)
+        )
+        return
+
         internal_id = ch.get("internal_id") or ch.get("id")
         title = ch.get("title") or handle
 
