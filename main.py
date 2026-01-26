@@ -125,6 +125,10 @@ def search_channel(handle: str) -> Dict[str, Any]:
 
 
 def fetch_channel_stats(internal_id: str) -> Dict[str, Any]:
+    # Telemetr /v1/channel/stats требует именно internal_id
+    res = telemetr_get("/v1/channel/stats", {"internal_id": internal_id})
+    return first_dict(res)
+
     """
     Tries to fetch stats with different parameter names because
     Telemetr API sometimes expects different keys depending on plan/version.
