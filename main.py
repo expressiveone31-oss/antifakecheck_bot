@@ -74,9 +74,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         internal_id = ch.get("internal_id") or ch.get("id")
         title = ch.get("title") or handle
 
-        stats = telemetr_get("/v1/channel/stats", {
-            "internal_id": internal_id
-        })
+        stats = telemetr_get(f"/v1/channels/{internal_id}/metrics", {})
 
         s = stats[0] if isinstance(stats, list) and stats else {}
 
