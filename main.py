@@ -65,11 +65,20 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         ch = res[0]
-        import json
-        await update.message.reply_text(
-            "SEARCH RESPONSE:\n" + json.dumps(ch, ensure_ascii=False, indent=2)
-        )
-        return
+        internal_id = ch.get("internal_id")
+        title = ch.get("title") or handle
+        members = ch.get("members_count")
+        
+        metrics = telemetr_get(f"/v1/channels/{internal_id}/metrics", {})
+        
+        if isinstance(metrics, list) and metrics:
+            metrics = metrics[0]
+            
+        views = metrics.get("views_avg")
+        er = metrics.get("err_percent")
+        
+        risk = score_fake(er, views, members)
+
 
         internal_id = ch.get("internal_id") or ch.get("id")
         title = ch.get("title") or handle
