@@ -84,61 +84,89 @@ def base_fake_score(err_percent: float, avg_reach: int, members: int) -> int:
 # --------------------------
 # Event-based flag detection
 # --------------------------
+# Ключевые слова — только про накрутку/фрод (без "bot")
 SUSPECT_KEYWORDS = [
-    "накрут", "подозр", "fake", "bot", "fraud", "scam",
-    "artificial", "manipulat", "просмотр", "view", "подписчик", "subscriber"
+    "накрут", "подозр", "фейк", "fake", "fraud", "scam",
+    "artificial", "manipulat", "ботовод", "боты",
+    "просмотр", "view", "подписчик", "subscriber"
 ]
 
 def _contains_suspect_text(s: str) -> bool:
     s = (s or "").lower()
     return any(k in s for k in SUSPECT_KEYWORDS)
 
-def detect_telemetr_suspect_flag(obj, label: str) -> tuple[bool, str]:
+def detect_telemetr_suspect_flag(resp: dict) -> tuple[bool, str]:
     """
-    Универсальный поиск флага/сообщения о накрутке внутри dict/list/str.
-    Возвращает (flagged, reason) с указанием источника (stat/get).
+    Возвращает (True/False, reason).
+
+    ВАЖНО:
+    - Не сканируем весь JSON подряд (это даёт фолсы на about, ссылки на рекламных ботов и т.д.)
+    - Смотрим только на явные флаги и на "служебные" поля модерации/предупреждений.
     """
-    # 1) булевые флаги в dict
-    if isinstance(obj, dict):
-        for key in ("is_badlisted", "badlisted", "is_suspicious", "suspected", "is_scam", "scam"):
-            if obj.get(key) is True:
-                return True, f"{label}: {key}=true"
-
-        for key in ("restrictions", "warnings", "alerts", "notes", "flags", "moderation"):
-            v = obj.get(key)
-            if isinstance(v, str) and _contains_suspect_text(v):
-                return True, f"{label}: {key}='{v}'"
-            if isinstance(v, list):
-                for item in v:
-                    flagged, reason = detect_telemetr_suspect_flag(item, f"{label}.{key}")
-                    if flagged:
-                        return True, reason
-            if isinstance(v, dict):
-                flagged, reason = detect_telemetr_suspect_flag(v, f"{label}.{key}")
-                if flagged:
-                    return True, reason
-
-        # 2) рекурсивный проход по значениям
-        for k, v in obj.items():
-            flagged, reason = detect_telemetr_suspect_flag(v, f"{label}.{k}")
-            if flagged:
-                return True, reason
-
+    if not isinstance(resp, dict):
         return False, ""
 
-    if isinstance(obj, list):
-        for i, v in enumerate(obj):
-            flagged, reason = detect_telemetr_suspect_flag(v, f"{label}[{i}]")
-            if flagged:
-                return True, reason
-        return False, ""
+    # 1) Явные булевые флаги (самое надёжное)
+    BOOL_FLAGS = (
+        "is_badlisted", "badlisted",
+        "is_suspicious", "suspected",
+        "is_scam", "scam",
+        "is_fraud", "fraud",
+    )
+    for key in BOOL_FLAGS:
+        if resp.get(key) is True:
+            return True, f"Telemetr flag: {key}=true"
 
-    if isinstance(obj, str):
-        if _contains_suspect_text(obj):
-            return True, f"{label}: '{obj}'"
-        return False, ""
+    # 2) Служебные поля, где обычно живут предупреждения/модерация
+    # (важно: сюда НЕ включаем about/title/description/username)
+    MOD_FIELDS = (
+        "warnings", "alerts", "flags",
+        "restrictions", "moderation",
+        "notes", "labels", "status",
+        "risk", "fraud_status", "scam_status",
+    )
 
+    # Проверяем значения в этих полях
+    for key in MOD_FIELDS:
+        if key not in resp:
+            continue
+
+        v = resp.get(key)
+
+        # строка
+        if isinstance(v, str) and _contains_suspect_text(v):
+            return True, f"Telemetr {key}: {v}"
+
+        # список строк/объектов
+        if isinstance(v, list):
+            for i, item in enumerate(v):
+                if isinstance(item, str) and _contains_suspect_text(item):
+                    return True, f"Telemetr {key}[{i}]: {item}"
+                if isinstance(item, dict):
+                    for k2 in ("type", "message", "text", "reason", "title", "description", "code"):
+                        t = item.get(k2)
+                        if isinstance(t, str) and _contains_suspect_text(t):
+                            return True, f"Telemetr {key}[{i}].{k2}: {t}"
+                    # Также если внутри item есть явный булевый флаг
+                    for bf in BOOL_FLAGS:
+                        if item.get(bf) is True:
+                            return True, f"Telemetr {key}[{i}]: {bf}=true"
+
+        # вложенный объект
+        if isinstance(v, dict):
+            # сначала ищем явные булевые
+            for bf in BOOL_FLAGS:
+                if v.get(bf) is True:
+                    return True, f"Telemetr {key}: {bf}=true"
+            # потом пробуем типовые текстовые ключи
+            for k2 in ("type", "message", "text", "reason", "description", "code"):
+                t = v.get(k2)
+                if isinstance(t, str) and _contains_suspect_text(t):
+                    return True, f"Telemetr {key}.{k2}: {t}"
+
+    # 3) НИЧЕГО НЕ НАШЛИ → флага нет
     return False, ""
+
 
 # --------------------------
 # Telegram handlers
