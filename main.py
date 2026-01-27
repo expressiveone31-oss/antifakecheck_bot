@@ -170,19 +170,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не распознала канал 😕 Пришли ссылку вида https://t.me/username или @username.")
         return
 
-   try:
-    data = telemetr_get("/channels/stat", {"channelId": channel_id})
-    resp = data.get("response", {})
-except requests.exceptions.Timeout:
-    await update.message.reply_text(
-        "⏳ Telemetr временно не отвечает.\n"
-        "Попробуй ещё раз через минуту."
-    )
-    return
-except requests.HTTPError as e:
-    await update.message.reply_text(f"Ошибка Telemetr API:\n{e}")
-    return
-
+    try:
+        data = telemetr_get("/channels/stat", {"channelId": channel_id})
+        resp = data.get("response", {})
 
         title = resp.get("title") or channel_id
         username = resp.get("username") or channel_id
