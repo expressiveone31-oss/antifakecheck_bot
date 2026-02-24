@@ -1,12 +1,13 @@
 import os
 import re
-import time
 import math
+import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
@@ -14,6 +15,10 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+# Настройка логов для отладки
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # =========================
 # Настройки
@@ -40,16 +45,20 @@ class ScoreResult:
     telemetr_reason: str = ""
 
 # =========================
-# Математика и Логика
+# Математика
 # =========================
 
 def calculate_cv(values: List[int]) -> float:
-    """Считает коэффициент вариации. Низкий CV = подозрительно ровные просмотры."""
-    if not values or len(values) < 3: return 0.5 # Недостаточно данных для подозрений
+    """Считает CV. Чем ниже число, тем 'подозрительнее' стабильность просмотров."""
+    if not values or len(values) < 5: return 0.5 
     avg = sum(values) / len(values)
     if avg == 0: return 0
     variance = sum((x - avg) ** 2 for x in values) / len(values)
     return math.sqrt(variance) / avg
+
+# =========================
+# Scoring Logic
+# =========================
 
 def compute_risk(
     members: int,
@@ -57,71 +66,69 @@ def compute_risk(
     er_percent: float,
     mentions_count: int,
     forwards_count: int,
-    posts_count: int,
-    recent_views: List[int] = None, # Нужно для анализа "ровности"
+    recent_views: List[int] = None,
     scoring_rate: int = 100
 ) -> ScoreResult:
     blocks: List[ScoreBlock] = []
     
-    # 1. Индекс Цитируемости vs Охват (0-3 балла)
-    # Если охват большой, а упоминаний (mentions) нет — это "налив" просмотров
+    # 1. Внешний трафик (0-3)
     s1 = 0.0
     bullets1 = []
-    if avg_reach > 1000 and mentions_count < 3:
+    if avg_reach > 1000 and mentions_count < 5:
         s1 = 3.0
-        bullets1.append("⚠️ Фантомный охват: просмотры есть, а упоминаний в других каналах нет")
-    elif avg_reach > 5000 and mentions_count < 15:
+        bullets1.append("⚠️ Фантомный охват: упоминаний в 10 раз меньше нормы")
+    elif avg_reach > 5000 and mentions_count < 20:
         s1 = 1.5
-        bullets1.append("Низкая цитируемость для такого охвата")
+        bullets1.append("Низкая цитируемость для такого масштаба")
     else:
-        bullets1.append("Ок: цитируемость соответствует охвату")
+        bullets1.append("Цитируемость в пределах нормы")
     blocks.append(ScoreBlock("Внешний трафик", s1, 3.0, bullets1))
 
-    # 2. Аномальная ровность просмотров (0-2.5 балла)
+    # 2. Анализ Ровности CV (0-3) - ТЕПЕРЬ С ДАННЫМИ
     s2 = 0.0
     bullets2 = []
     if recent_views and len(recent_views) >= 5:
         cv = calculate_cv(recent_views)
-        bullets2.append(f"Вариативность просмотров (CV): {cv:.2f}")
-        if cv < 0.12: # Просмотры почти идентичны
-            s2 = 2.5
-            bullets2.append("🚨 Слишком ровные просмотры: признак автонакрутки")
-        elif cv < 0.20:
-            s2 = 1.0
-            bullets2.append("Подозрительно стабильные просмотры")
+        bullets2.append(f"Коэффициент вариации (CV): {cv:.2f}")
+        if cv < 0.15:
+            s2 = 3.0
+            bullets2.append("🚨 Критически ровные просмотры (автонакрутка)")
+        elif cv < 0.25:
+            s2 = 1.5
+            bullets2.append("Подозрительно стабильный охват")
     else:
-        bullets2.append("Недостаточно данных по постам для анализа CV")
-    blocks.append(ScoreBlock("Ровность (CV)", s2, 2.5, bullets2))
+        bullets2.append("❌ Недостаточно данных по постам (нужно минимум 5)")
+    blocks.append(ScoreBlock("Ровность (CV)", s2, 3.0, bullets2))
 
-    # 3. Баланс ER и Охвата (0-2.5 балла)
+    # 3. Качество базы (0-2)
     s3 = 0.0
     bullets3 = []
     reach_ratio = (avg_reach / members) if members else 0
-    if members > 1000:
-        if reach_ratio < 0.03: # Охват меньше 3% от базы
-            s3 = 2.5
-            bullets3.append(f"Reach/Subs ({reach_ratio:.2%}) критически мал — в канале 'мертвые души'")
-        elif er_percent < 5:
+    if members > 500:
+        if reach_ratio < 0.04:
+            s3 = 2.0
+            bullets3.append(f"Охват всего {reach_ratio:.1%} — база 'мертвая'")
+        elif er_percent < 6:
             s3 = 1.0
-            bullets3.append(f"Низкая вовлеченность (ER {er_percent}%)")
-    blocks.append(ScoreBlock("Качество базы", s3, 2.5, bullets3))
+            bullets3.append(f"Низкий ER ({er_percent}%)")
+    blocks.append(ScoreBlock("Качество базы", s3, 2.0, bullets3))
 
-    # 4. Пересылки (0-2 балла)
+    # 4. Реакции (0-1)
     s4 = 0.0
     bullets4 = []
-    if avg_reach > 10000 and forwards_count < 5:
-        s4 = 2.0
-        bullets4.append("🚨 Огромный охват при почти нулевых репостах")
-    blocks.append(ScoreBlock("Реакции", s4, 2.0, bullets4))
+    if avg_reach > 5000 and forwards_count < 2:
+        s4 = 1.0
+        bullets4.append("Подозрительно мало репостов")
+    blocks.append(ScoreBlock("Реакции", s4, 1.0, bullets4))
 
-    # Итоговый расчет
+    # Итоговый риск
     raw_sum = sum(b.score for b in blocks)
-    risk = int(min(10, max(1, round(raw_sum + 1)))) # База 1, макс 10
+    risk = int(min(10, max(1, round(raw_sum + 1))))
     
-    # "Пол" по внутреннему рейтингу Telemetr
+    # Floor по рейтингу Telemetr
     telemetr_floor = False
     reason = ""
-    if scoring_rate < 30:
+    if scoring_rate < 35:
         if risk < 7:
             risk = 7
             telemetr_floor = True
@@ -130,35 +137,38 @@ def compute_risk(
     return ScoreResult(risk=risk, blocks=blocks, telemetr_floor_applied=telemetr_floor, telemetr_reason=reason)
 
 # =========================
-# API и Обработка
+# API Fetching
 # =========================
 
-def extract_channel_id(text: str) -> Optional[str]:
-    m = re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]{5,})", text)
-    if m: return m.group(1)
-    t = text.strip().replace("@", "")
-    if re.fullmatch(r"[A-Za-z0-9_]{5,}", t): return t
-    return None
-
 def telemetr_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    r = _session.get(f"{TELEMETR_BASE_URL}{path}", headers=HEADERS, params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = _session.get(f"{TELEMETR_BASE_URL}{path}", headers=HEADERS, params=params, timeout=25)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.error(f"API Error at {path}: {e}")
+        return {}
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = extract_channel_id(update.message.text or "")
+    raw_text = update.message.text or ""
+    # Извлекаем username
+    cid = re.search(r"(?:t\.me/|@)?([A-Za-z0-9_]{5,})", raw_text)
     if not cid:
-        await update.message.reply_text("Пришлите ссылку на канал")
+        await update.message.reply_text("Пришлите ссылку или @username")
         return
+    channel_id = cid.group(1)
 
     try:
-        # Получаем общую статику
-        st_data = telemetr_get("/channels/stat", {"channelId": cid}).get("response", {})
+        # 1. Запрос основной статистики
+        st_data = telemetr_get("/channels/stat", {"channelId": channel_id}).get("response", {})
         
-        # Для анализа ровности вытягиваем последние посты (если API позволяет)
-        # В некоторых тарифах это /posts/search с фильтром по channel_id
-        # Если данных нет, CV будет пропущен.
-        views_history = st_data.get("recent_posts_views", []) 
+        # 2. Запрос последних постов для CV (наиболее надежный способ получить просмотры)
+        # Если твой тариф позволяет, используем поиск постов канала
+        posts_data = telemetr_get("/posts/search", {"channel_id": channel_id, "limit": 10})
+        posts_list = posts_data.get("response", {}).get("items", [])
+        
+        # Вытягиваем только цифры просмотров
+        views_history = [p.get("views_count", 0) for p in posts_list if p.get("views_count")]
 
         sr = compute_risk(
             members=int(st_data.get("participants_count") or 0),
@@ -166,38 +176,36 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             er_percent=float(st_data.get("err_percent") or 0),
             mentions_count=int(st_data.get("mentions_count") or 0),
             forwards_count=int(st_data.get("forwards_count") or 0),
-            posts_count=int(st_data.get("posts_count") or 0),
             recent_views=views_history,
             scoring_rate=int(st_data.get("scoring_rate") or 100)
         )
 
-        # Сборка сообщения
-        res_msg = [
-            f"📊 *Анализ канала: {cid}*",
+        # Формируем отчет
+        res = [
+            f"📊 *Анализ канала: {channel_id}*",
             f"📈 Риск накрутки: `{sr.risk}/10`",
             "---"
         ]
         
         for b in sr.blocks:
-            icon = "🔴" if b.score > 1.5 else "🟡" if b.score > 0 else "🟢"
-            res_msg.append(f"{icon} *{b.title}*: {b.score}/{b.max_score}")
+            icon = "🔴" if b.score >= 1.5 else "🟡" if b.score > 0 else "🟢"
+            res.append(f"{icon} *{b.title}*: {b.score:g}/{b.max_score:g}")
             for bullet in b.bullets:
-                res_msg.append(f"  • {bullet}")
+                res.append(f"  • {bullet}")
         
         if sr.telemetr_floor_applied:
-            res_msg.append(f"\n❗ *Применен фильтр:* {sr.telemetr_reason}")
+            res.append(f"\n❗ *Применен фильтр:* {sr.telemetr_reason}")
 
-        await update.message.reply_text("\n".join(res_msg), parse_mode="Markdown")
+        await update.message.reply_text("\n".join(res), parse_mode=ParseMode.MARKDOWN)
 
     except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
+        await update.message.reply_text(f"Ошибка при обработке: {e}")
 
-# =========================
-# Запуск
-# =========================
 def main():
+    if not BOT_TOKEN or not TELEMETR_TOKEN:
+        print("BOT_TOKEN или TELEMETR_TOKEN не найдены!")
+        return
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("Пришли username канала")))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.run_polling()
 
