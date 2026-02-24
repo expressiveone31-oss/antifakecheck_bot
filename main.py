@@ -1,12 +1,10 @@
 import os
 import re
 import math
-import asyncio
-import datetime as dt
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
-
+import statistics
 import requests
+from typing import Any, Dict, List, Tuple, Optional
+
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -22,34 +20,35 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEMETR_TOKEN = os.getenv("TELEMETR_TOKEN", "").strip()
 
-# Telemetr.me API (НЕ telemetr.io)
+# Telemetr.me (НЕ telemetr.io)
 TELEMETR_BASE_URL = os.getenv("TELEMETR_BASE_URL", "https://api.telemetr.me").rstrip("/")
+
+TIMEOUT = int(os.getenv("TELEMETR_TIMEOUT", "25"))
+# если Telemetr часто тупит — поставь 40–60
+# TIMEOUT = 45
 
 HEADERS = {
     "Authorization": f"Bearer {TELEMETR_TOKEN}",
     "Accept": "application/json",
 }
 
-TIMEOUT = 25
-
 # =========================
-# Helpers
+# Helpers: parse channel id
 # =========================
 def extract_channel_id(text: str) -> Optional[str]:
     """
-    Accepts:
+    Принимает:
       - https://t.me/username
       - t.me/username
       - @username
       - username
-      - joinchat / +AAAA... (optional; not used now)
-    Returns channelId for Telemetr.me.
+    Возвращает channelId для Telemetr.me (username / joinchat если надо будет).
     """
     if not text:
         return None
 
     t = text.strip()
-    t = t.strip(" \n\t<>[](){}.,;")
+    t = t.strip(" \n\t<>[](){}.,;\"'")
 
     m = re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]{5,})", t)
     if m:
@@ -66,7 +65,10 @@ def extract_channel_id(text: str) -> Optional[str]:
     return None
 
 
-def telemetr_get(path: str, params: dict):
+# =========================
+# Telemetr API
+# =========================
+def telemetr_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{TELEMETR_BASE_URL}{path}"
     r = requests.get(url, headers=HEADERS, params=params, timeout=TIMEOUT)
 
@@ -77,12 +79,13 @@ def telemetr_get(path: str, params: dict):
             body = r.text
         raise requests.HTTPError(
             f"{r.status_code} {r.reason} for url: {r.url}\nResponse: {body}",
-            response=r
+            response=r,
         )
+
     return r.json()
 
 
-def telemetr_post(path: str, payload: dict):
+def telemetr_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{TELEMETR_BASE_URL}{path}"
     r = requests.post(url, headers=HEADERS, json=payload, timeout=TIMEOUT)
 
@@ -93,438 +96,300 @@ def telemetr_post(path: str, payload: dict):
             body = r.text
         raise requests.HTTPError(
             f"{r.status_code} {r.reason} for url: {r.url}\nResponse: {body}",
-            response=r
+            response=r,
         )
+
     return r.json()
 
 
-def _as_float(x, default=0.0) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-
-def _as_int(x, default=0) -> int:
-    try:
-        return int(float(x))
-    except Exception:
-        return default
-
-
-def _fmt_signed(n: int) -> str:
-    if n > 0:
-        return f"+{n}"
-    return str(n)
-
-
-def _pct(num: float) -> float:
-    return num * 100.0
-
-
-def now_utc() -> dt.datetime:
-    return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
-
-
-def fmt_telemetr_date(d: dt.datetime) -> str:
-    # API docs show: "YYYY-MM-DD HH:MM:SS"
-    return d.strftime("%Y-%m-%d %H:%M:%S")
-
-
 # =========================
-# Event-based suspect flag
+# Event-based flag detection (Telemetr suspect)
 # =========================
-# ВАЖНО: избегаем ложных срабатываний по "about" (там часто реклама/боты/РКН и т.д.)
-# Ищем только "служебные" поля и явные булевы флаги.
-BOOL_FLAGS = (
-    "is_badlisted", "badlisted",
-    "is_suspicious", "suspected",
-    "is_scam", "scam",
-    "is_fraud", "fraud",
-)
-
-SAFE_TEXT_KEYS = (
-    # только те поля, которые с высокой вероятностью реально про модерацию/предупреждение
-    "warning", "warnings",
-    "moderation", "moderation_message",
-    "restriction", "restrictions",
-    "status", "code", "reason",
-)
-
-SUSPECT_KEYWORDS = (
-    "накрут", "подозр", "фейк", "мошен", "скам", "fraud", "scam", "fake", "manipulat",
+SUSPECT_KEYWORDS = [
+    "накрут", "подозр", "фейк", "fake", "fraud", "scam",
+    "artificial", "manipulat", "ботовод", "боты",
     "просмотр", "view", "подписчик", "subscriber",
-)
-
+    "suspicious", "suspect", "badlist", "blacklist"
+]
 
 def _contains_suspect_text(s: str) -> bool:
     s = (s or "").lower()
     return any(k in s for k in SUSPECT_KEYWORDS)
 
-
-def detect_telemetr_suspect_flag(resp: dict) -> Tuple[bool, str]:
+def detect_telemetr_suspect_flag(resp: Dict[str, Any]) -> Tuple[bool, str]:
     """
-    Returns (flag, reason).
-    We only look at:
-      - explicit boolean flags in resp or nested dict/list items
-      - moderation/restriction-like fields (safe keys)
+    Возвращает (True/False, reason)
+    Ищем только "служебные" признаки, а не описание канала.
     """
     if not isinstance(resp, dict):
-        return (False, "")
+        return False, ""
 
-    # 1) explicit boolean flags on top-level
-    for k in BOOL_FLAGS:
-        if resp.get(k) is True:
-            return (True, f"Telemetr flag: {k}=true")
+    # 1) явные булевы флаги — самое надежное
+    BOOL_FLAGS = (
+        "is_badlisted", "badlisted",
+        "is_suspicious", "suspected",
+        "is_scam", "scam",
+        "is_fraud", "fraud",
+        "is_blacklisted", "blacklisted",
+    )
+    for key in BOOL_FLAGS:
+        if resp.get(key) is True:
+            return True, f"Telemetr flag: {key}=true"
 
-    # 2) scan nested values but carefully (dict/list), still prefer explicit flags
-    for key, v in resp.items():
-        # explicit nested dict
+    # 2) служебные поля: moderation/warnings/flags (НЕ about)
+    SERVICE_KEYS = ("warnings", "warning", "moderation", "flags", "status", "meta")
+    for sk in SERVICE_KEYS:
+        v = resp.get(sk)
+        if isinstance(v, str) and _contains_suspect_text(v):
+            return True, f"Telemetr {sk}: {v}"
         if isinstance(v, dict):
-            for k in BOOL_FLAGS:
-                if v.get(k) is True:
-                    return (True, f"Telemetr flag: {key}.{k}=true")
-
-            # safe text keys inside nested dict
-            for tk in SAFE_TEXT_KEYS:
-                tv = v.get(tk)
-                if isinstance(tv, str) and _contains_suspect_text(tv):
-                    return (True, f"Telemetr note: {key}.{tk}: {tv}")
-
-        # list of items
+            for bf in BOOL_FLAGS:
+                if v.get(bf) is True:
+                    return True, f"Telemetr {sk}: {bf}=true"
+            for k2 in ("type", "message", "text", "reason", "description", "code"):
+                t = v.get(k2)
+                if isinstance(t, str) and _contains_suspect_text(t):
+                    return True, f"Telemetr {sk}.{k2}: {t}"
         if isinstance(v, list):
-            for i, item in enumerate(v[:50]):
+            for i, item in enumerate(v[:10]):
                 if isinstance(item, dict):
-                    for k in BOOL_FLAGS:
-                        if item.get(k) is True:
-                            return (True, f"Telemetr flag: {key}[{i}].{k}=true")
-                    for tk in SAFE_TEXT_KEYS:
-                        tv = item.get(tk)
-                        if isinstance(tv, str) and _contains_suspect_text(tv):
-                            return (True, f"Telemetr note: {key}[{i}].{tk}: {tv}")
+                    for bf in BOOL_FLAGS:
+                        if item.get(bf) is True:
+                            return True, f"Telemetr {sk}[{i}]: {bf}=true"
+                    for k2 in ("type", "message", "text", "reason", "description", "code"):
+                        t = item.get(k2)
+                        if isinstance(t, str) and _contains_suspect_text(t):
+                            return True, f"Telemetr {sk}[{i}].{k2}: {t}"
+                elif isinstance(item, str) and _contains_suspect_text(item):
+                    return True, f"Telemetr {sk}[{i}]: {item}"
 
-        # safe text keys at top level
-        if key in SAFE_TEXT_KEYS and isinstance(v, str) and _contains_suspect_text(v):
-            return (True, f"Telemetr note: {key}: {v}")
-
-    return (False, "")
+    return False, ""
 
 
 # =========================
-# Scoring configuration
+# Scoring (human-readable)
 # =========================
-@dataclass
-class ScorePart:
-    name: str
-    max_points: float
-    got: float
-    details: List[str]
-
-
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
+def safe_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
 
-def compute_cv(values: List[float]) -> Optional[float]:
-    if not values or len(values) < 3:
-        return None
-    m = sum(values) / len(values)
-    if m <= 0:
-        return None
-    var = sum((v - m) ** 2 for v in values) / (len(values) - 1)
-    sd = math.sqrt(var)
-    return sd / m
+def safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
 
+def cv(values: List[float]) -> float:
+    """Coefficient of variation: std/mean. If mean==0 -> large."""
+    if not values:
+        return 0.0
+    m = statistics.mean(values)
+    if m == 0:
+        return 999.0
+    s = statistics.pstdev(values)
+    return float(s / m)
 
-def score_from_subs_dynamics(
-    members: int,
-    day_delta: int,
-    week_delta: int,
-    month_delta: int,
-) -> ScorePart:
+def score_block_a_subscriber_dynamics(members: int, day_delta: int, week_delta: int, month_delta: int) -> Tuple[float, List[str]]:
     """
-    Главный блок (0–4): динамика подписчиков.
-    Считаем проценты + минимальный абсолют, чтобы не ловить шум.
+    Главный блок.
+    Считаем проценты и минимальный абсолют, чтобы не ловить шум.
+    Возвращает (баллы 0–4, причины).
     """
-    max_points = 4.0
-    got = 0.0
-    details = []
+    pts = 0.0
+    reasons = []
 
-    def add(points: float, line: str):
-        nonlocal got
-        got += points
-        details.append(f"• {line} → +{points:g}")
+    def add(rule: str, add_pts: float):
+        nonlocal pts
+        pts += add_pts
+        reasons.append(rule)
 
-    def check_delta(period: str, delta: int, abs_min: int, pct_min: float, points: float):
+    def pct(delta: int) -> float:
         if members <= 0:
-            return
-        pct = abs(delta) / members
-        if abs(delta) >= abs_min and pct >= pct_min:
-            add(points, f"{period}: Δ={_fmt_signed(delta)} ({_pct(pct):.2f}%), порог {abs_min}+ и { _pct(pct_min):.2f}%+")
+            return 0.0
+        return (delta / members) * 100.0
 
-    # DAY thresholds (как ты предложила)
-    # если Δday% ≤ −0.35% и abs(Δday) ≥ 300 → +2
-    # если Δday% ≤ −0.60% и abs(Δday) ≥ 500 → +3
-    # (берём abs по модулю, т.к. накрутка может быть и ростом, и списаниями)
-    check_delta("День", day_delta, 300, 0.0035, 2.0)
-    check_delta("День", day_delta, 500, 0.0060, 3.0)
+    # День
+    p_day = pct(day_delta)
+    if (p_day <= -0.60) and (abs(day_delta) >= 500):
+        add(f"день: Δ={day_delta} ({p_day:.2f}%) → +3", 3.0)
+    elif (p_day <= -0.35) and (abs(day_delta) >= 300):
+        add(f"день: Δ={day_delta} ({p_day:.2f}%) → +2", 2.0)
 
-    # WEEK (рабочие пороги, можно потом покрутить)
-    check_delta("Неделя", week_delta, 3000, 0.0150, 2.0)
-    check_delta("Неделя", week_delta, 5000, 0.0250, 3.0)
+    # Неделя (примерная логика, можешь править)
+    p_week = pct(week_delta)
+    if (p_week <= -2.0) and (abs(week_delta) >= 2000):
+        add(f"неделя: Δ={week_delta} ({p_week:.2f}%) → +2", 2.0)
 
-    # MONTH
-    check_delta("Месяц", month_delta, 12000, 0.0500, 2.0)
-    check_delta("Месяц", month_delta, 20000, 0.0800, 3.0)
+    # Месяц (примерная логика)
+    p_month = pct(month_delta)
+    if (p_month <= -8.0) and (abs(month_delta) >= 8000):
+        add(f"месяц: Δ={month_delta} ({p_month:.2f}%) → +2", 2.0)
 
-    got = clamp(got, 0.0, max_points)
+    pts = clamp(pts, 0.0, 4.0)
+    if not reasons:
+        reasons.append("нет сильных сигналов")
+    return pts, reasons
 
-    if not details:
-        details.append("• нет сильных сигналов (порогов не достигли)")
-
-    summary = f"(день {_fmt_signed(day_delta)}, неделя {_fmt_signed(week_delta)}, месяц {_fmt_signed(month_delta)})"
-    details.insert(0, summary)
-
-    return ScorePart(
-        name="1) Динамика подписчиков (главный)",
-        max_points=max_points,
-        got=got,
-        details=details,
-    )
-
-
-def score_reach_vs_subs(members: int, avg_reach: int) -> ScorePart:
+def score_block_b_members_vs_reach_er(members: int, avg_reach: int, err_percent: float) -> Tuple[float, List[str]]:
     """
-    0–3: охват/подписчики
+    0–3 балла.
+    Идея: подозрительно низкий охват/подписчики или странный ER.
     """
-    max_points = 3.0
-    got = 0.0
-    details = []
+    pts = 0.0
+    reasons = []
 
-    if members <= 0 or avg_reach <= 0:
-        return ScorePart(
-            name="2) Подписчики vs охват",
-            max_points=max_points,
-            got=0.0,
-            details=["• нет данных для сравнения (members/avg_reach пустые)"],
-        )
+    if members > 0 and avg_reach > 0:
+        ratio = avg_reach / members  # доля охвата
+        # очень низко
+        if ratio < 0.04:
+            pts += 3.0
+            reasons.append(f"охват/подписчики={ratio:.3f} (<0.04) → +3")
+        elif ratio < 0.08:
+            pts += 1.5
+            reasons.append(f"охват/подписчики={ratio:.3f} (<0.08) → +1.5")
+        else:
+            reasons.append(f"охват/подписчики={ratio:.3f} — ок")
 
-    ratio = avg_reach / members
-    details.append(f"• охват/подписчики = {ratio:.3f} ({_pct(ratio):.1f}%)")
-
-    # мягкие эвристики
-    if ratio < 0.03:
-        got += 3.0
-        details.append("• очень низкий охват для такой базы → +3")
-    elif ratio < 0.05:
-        got += 2.0
-        details.append("• низковатый охват → +2")
-    elif ratio < 0.08:
-        got += 1.0
-        details.append("• немного низкий охват → +1")
+    # err_percent (у тебя это ER, судя по Telemetr /channels/stat)
+    if err_percent < 5.0:
+        pts += 1.5
+        reasons.append(f"ER={err_percent:.2f}% (<5) → +1.5")
+    elif err_percent < 8.0:
+        pts += 0.8
+        reasons.append(f"ER={err_percent:.2f}% (<8) → +0.8")
     else:
-        details.append("• выглядит ок")
+        reasons.append(f"ER={err_percent:.2f}% — ок")
 
-    got = clamp(got, 0.0, max_points)
-    return ScorePart(
-        name="2) Подписчики vs охват",
-        max_points=max_points,
-        got=got,
-        details=details,
-    )
+    pts = clamp(pts, 0.0, 3.0)
+    return pts, reasons
 
-
-def score_er(err_percent: float) -> ScorePart:
+def score_block_c_views_smoothness(post_reaches: List[int]) -> Tuple[float, List[str]]:
     """
-    0–1: ER как слабый сигнал (сам по себе не доказательство)
+    0–1.5 балла.
+    Слишком "ровные" охваты могут быть сигналом.
     """
-    max_points = 1.0
-    got = 0.0
-    details = [f"• ER = {err_percent:.2f}%"]
+    if not post_reaches:
+        return 0.0, ["нет данных по постам"]
 
-    # Здесь специально слабые веса: ER легко “нарисовать”.
-    if err_percent < 3.0:
-        got += 1.0
-        details.append("• слишком низкий ER → +1")
+    vals = [float(x) for x in post_reaches if x is not None]
+    if len(vals) < 8:
+        return 0.0, [f"мало постов для оценки (n={len(vals)})"]
+
+    c = cv(vals)
+    # Чем ниже CV, тем "ровнее".
+    pts = 0.0
+    reasons = [f"ровность просмотров: CV={c:.2f} (ниже = ровнее)"]
+
+    if c < 0.15:
+        pts = 1.5
+        reasons.append("слишком ровно → +1.5")
+    elif c < 0.22:
+        pts = 0.8
+        reasons.append("подозрительно ровно → +0.8")
+
+    return clamp(pts, 0.0, 1.5), reasons
+
+def score_block_d_forwards(forwards: int, avg_reach: int) -> Tuple[float, List[str]]:
+    """
+    0–1 балл.
+    Упрощённо: ноль пересылок при большом охвате иногда странно.
+    """
+    pts = 0.0
+    reasons = []
+
+    if avg_reach >= 20000 and forwards <= 1:
+        pts = 1.0
+        reasons.append(f"пересылки={forwards} при охвате={avg_reach} → +1")
     else:
-        details.append("• по ER явных проблем нет")
+        reasons.append("нет явных аномалий по пересылкам")
 
-    got = clamp(got, 0.0, max_points)
-    return ScorePart(
-        name="3) ER (слабый сигнал)",
-        max_points=max_points,
-        got=got,
-        details=details,
-    )
+    return pts, reasons
 
-
-def score_forward_mentions(forwards: int, mentions: int, members: int) -> ScorePart:
+def score_block_e_er_sanity(err_percent: float, avg_reach: int, members: int) -> Tuple[float, List[str]]:
     """
-    0–2: пересылки/упоминания — косвенный сигнал “живости”
+    0–0.5 балла.
+    Лёгкий sanity-check: очень высокий ER при очень низком охвате/подписчиках и т.п.
     """
-    max_points = 2.0
-    got = 0.0
-    details = [
-        f"• пересылки: {forwards}",
-        f"• упоминания: {mentions}",
-    ]
+    pts = 0.0
+    reasons = ["нет явных проблем по ER/reach"]
 
-    if members <= 0:
-        details.append("• нет данных по подписчикам → пропуск")
-        return ScorePart(
-            name="4) Упоминания/пересылки",
-            max_points=max_points,
-            got=0.0,
-            details=details,
-        )
+    if members > 0 and avg_reach > 0:
+        ratio = avg_reach / members
+        # если охват очень низкий, но ER высокий — может быть странно (пример)
+        if ratio < 0.03 and err_percent > 20:
+            pts = 0.5
+            reasons = [f"охват/подписчики={ratio:.3f} и ER={err_percent:.2f}% → +0.5"]
 
-    # Очень грубо: если канал большой, а пересылок/упоминаний почти нет — подозрительно.
-    if members >= 100_000 and (forwards + mentions) < 50:
-        got += 2.0
-        details.append("• для большого канала слишком мало сигналов распространения → +2")
-    elif members >= 50_000 and (forwards + mentions) < 20:
-        got += 1.5
-        details.append("• мало сигналов распространения → +1.5")
-    else:
-        details.append("• выглядит ок")
-
-    got = clamp(got, 0.0, max_points)
-    return ScorePart(
-        name="4) Упоминания/пересылки",
-        max_points=max_points,
-        got=got,
-        details=details,
-    )
+    return pts, reasons
 
 
-def total_score_to_risk(total_points: float) -> int:
+def build_scoring_breakdown(resp: Dict[str, Any], post_reaches: List[int]) -> Tuple[int, str]:
     """
-    Переводим суммарные баллы в шкалу 1–10.
+    Возвращает (risk_int_1_10, breakdown_text)
     """
-    # максимум примерно 10, но у нас сейчас около 10
-    risk = int(round(clamp(1 + total_points, 1, 10)))
-    return risk
+    members = safe_int(resp.get("participants_count"), 0)
+    avg_reach = safe_int(resp.get("avg_post_reach"), 0)
+    err_percent = safe_float(resp.get("err_percent"), 0.0)
+    ci_index = resp.get("ci_index", 0)
+    scoring_rate = resp.get("scoring_rate", 0)
 
+    # Дельты подписчиков (если есть в /channels/stat)
+    day_delta = safe_int(resp.get("participants_today") or resp.get("subscribers_today") or resp.get("today") or 0)
+    week_delta = safe_int(resp.get("participants_week") or resp.get("subscribers_week") or resp.get("week") or 0)
+    month_delta = safe_int(resp.get("participants_month") or resp.get("subscribers_month") or resp.get("month") or 0)
 
-def build_explanation(parts: List[ScorePart]) -> str:
-    lines: List[str] = []
-    for p in parts:
-        lines.append(f"{p.name} ({p.got:.1f}/{p.max_points:.1f})")
-        for d in p.details:
-            lines.append(f"   {d}")
-        lines.append("")
-    return "\n".join(lines).strip()
+    # Блоки
+    a_pts, a_reasons = score_block_a_subscriber_dynamics(members, day_delta, week_delta, month_delta)
+    b_pts, b_reasons = score_block_b_members_vs_reach_er(members, avg_reach, err_percent)
+    c_pts, c_reasons = score_block_c_views_smoothness(post_reaches)
+    # forwards/mentions — могут отсутствовать в api, поэтому берём из resp если есть
+    forwards = safe_int(resp.get("forwards_count") or resp.get("forwards") or 0)
+    d_pts, d_reasons = score_block_d_forwards(forwards, avg_reach)
+    e_pts, e_reasons = score_block_e_er_sanity(err_percent, avg_reach, members)
 
+    total = a_pts + b_pts + c_pts + d_pts + e_pts
+    # Переводим 0..10: базово 1 + total (но чтобы не было 0)
+    risk = int(clamp(round(1 + total), 1, 10))
 
-def weights_text() -> str:
-    return (
-        "⚙️ Пороги и веса (текущая версия)\n\n"
-        "1) Динамика подписчиков (0–4)\n"
-        "   День: abs>=300 и >=0.35% → +2; abs>=500 и >=0.60% → +3\n"
-        "   Неделя: abs>=3000 и >=1.50% → +2; abs>=5000 и >=2.50% → +3\n"
-        "   Месяц: abs>=12000 и >=5.00% → +2; abs>=20000 и >=8.00% → +3\n\n"
-        "2) Подписчики vs охват (0–3)\n"
-        "   reach/subs <3% → +3; <5% → +2; <8% → +1\n\n"
-        "3) ER (слабый сигнал, 0–1)\n"
-        "   ER <3% → +1\n\n"
-        "4) Упоминания/пересылки (0–2)\n"
-        "   >100k subs и (mentions+forwards)<50 → +2\n"
-        "   >50k subs и (mentions+forwards)<20 → +1.5\n\n"
-        "🚨 Event-based правило\n"
-        "   Если Telemetr пометил канал (is_badlisted/is_suspicious/etc) → риск минимум 8/10\n"
-    )
+    # Event-based floor: если Telemetr пометил как подозрительный → минимум 8
+    flagged, flag_reason = detect_telemetr_suspect_flag(resp)
+    if flagged:
+        risk = max(risk, 8)
 
+    breakdown = []
+    breakdown.append("🧠 Разбор (почему такой риск):")
+    breakdown.append(f"1) Подписчики (0–4): {a_pts:.1f}/4.0  (день {day_delta:+}, неделя {week_delta:+}, месяц {month_delta:+})")
+    for r in a_reasons:
+        breakdown.append(f"   • {r}")
 
-# =========================
-# Data fetchers
-# =========================
-@dataclass
-class ChannelStat:
-    title: str
-    username: str
-    members: int
-    avg_reach: int
-    err_percent: float
-    ci_index: int
-    scoring_rate: float
-    mentions_count: int
-    forwards_count: int
-    raw_resp: dict
+    breakdown.append(f"\n2) Подписчики vs ER/охват (0–3): {b_pts:.1f}/3.0")
+    for r in b_reasons:
+        breakdown.append(f"   • {r}")
 
+    breakdown.append(f"\n3) Ровность просмотров (0–1.5): {c_pts:.1f}/1.5 (постов: {len(post_reaches)})")
+    for r in c_reasons:
+        breakdown.append(f"   • {r}")
 
-def fetch_channel_stat(channel_id: str) -> ChannelStat:
-    data = telemetr_get("/channels/stat", {"channelId": channel_id})
-    resp = data.get("response", {}) or {}
+    breakdown.append(f"\n4) Пересылки (0–1): {d_pts:.1f}/1.0")
+    for r in d_reasons:
+        breakdown.append(f"   • {r}")
 
-    title = resp.get("title") or channel_id
-    username = resp.get("username") or channel_id
+    breakdown.append(f"\n5) ER/reach (0–0.5): {e_pts:.1f}/0.5")
+    for r in e_reasons:
+        breakdown.append(f"   • {r}")
 
-    members = _as_int(resp.get("participants_count"), 0)
-    avg_reach = _as_int(resp.get("avg_post_reach"), 0)
-    err_percent = _as_float(resp.get("err_percent"), 0.0)
-    ci_index = _as_int(resp.get("ci_index"), 0)
-    scoring_rate = _as_float(resp.get("scoring_rate"), 0.0)
+    if flagged:
+        breakdown.append(f"\n🚨 Telemetr: канал помечен как подозрительный → риск минимум 8/10")
+        breakdown.append(f"Источник: {flag_reason}")
 
-    mentions_count = _as_int(resp.get("mentions_count"), 0)
-    forwards_count = _as_int(resp.get("forwards_count"), 0)
+    breakdown.append("\nКоманда: /weights — пороги и веса")
 
-    return ChannelStat(
-        title=title,
-        username=username,
-        members=members,
-        avg_reach=avg_reach,
-        err_percent=err_percent,
-        ci_index=ci_index,
-        scoring_rate=scoring_rate,
-        mentions_count=mentions_count,
-        forwards_count=forwards_count,
-        raw_resp=resp,
-    )
-
-
-def fetch_subscribers_series(channel_id: str, days: int = 30) -> List[dict]:
-    """
-    GET /channels/subscribers
-    Returns list in "response": [ {date:..., participants_count:...}, ... ]
-    We ask group=day for last `days` days.
-    """
-    end = now_utc()
-    start = end - dt.timedelta(days=days)
-    data = telemetr_get("/channels/subscribers", {
-        "channelId": channel_id,
-        "group": "day",
-        "startDate": fmt_telemetr_date(start),
-        "endDate": fmt_telemetr_date(end),
-    })
-    resp = data.get("response", [])
-    if isinstance(resp, list):
-        return resp
-    return []
-
-
-def compute_deltas_from_series(series: List[dict]) -> Tuple[int, int, int]:
-    """
-    Returns (day_delta, week_delta, month_delta) based on end-of-day counts.
-    If not enough points — returns 0 for missing periods.
-    """
-    # extract counts in chronological order if already so; if not, sort by date
-    def get_date(x):
-        return x.get("date") or ""
-    s = [x for x in series if isinstance(x, dict)]
-    s.sort(key=get_date)
-
-    counts = [_as_int(x.get("participants_count"), None) for x in s]
-    counts = [c for c in counts if c is not None]
-    if len(counts) < 2:
-        return (0, 0, 0)
-
-    last = counts[-1]
-
-    day_delta = last - counts[-2] if len(counts) >= 2 else 0
-    week_delta = last - counts[-8] if len(counts) >= 8 else 0   # ~7 days back
-    month_delta = last - counts[0] if len(counts) >= 30 else (last - counts[0])
-
-    return (day_delta, week_delta, month_delta)
+    return risk, "\n".join(breakdown)
 
 
 # =========================
@@ -532,7 +397,8 @@ def compute_deltas_from_series(series: List[dict]) -> Tuple[int, int, int]:
 # =========================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Кинь ссылку или @username Telegram-канала — я пришлю оценку накрутки (1–10) и объясню, почему."
+        "Кинь ссылку или @username Telegram-канала — я пришлю ER, CI и оценку накрутки (1–10).\n"
+        "Команды: /health /weights"
     )
 
 
@@ -541,12 +407,57 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "OK ✅\n"
         f"BASE_URL: {TELEMETR_BASE_URL}\n"
         f"TELEMETR_TOKEN set: {'YES' if bool(TELEMETR_TOKEN) else 'NO'}\n"
-        f"BOT_TOKEN set: {'YES' if bool(BOT_TOKEN) else 'NO'}"
+        f"TIMEOUT: {TIMEOUT}s"
     )
 
 
 async def cmd_weights(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(weights_text())
+    await update.message.reply_text(
+        "⚙️ Веса и пороги скоринга\n\n"
+        "A) Динамика подписчиков (0–4)\n"
+        "  • День: Δday% ≤ −0.35% и |Δday| ≥ 300  → +2\n"
+        "  • День: Δday% ≤ −0.60% и |Δday| ≥ 500  → +3\n"
+        "  • Неделя: Δweek% ≤ −2.0% и |Δweek| ≥ 2000 → +2\n"
+        "  • Месяц:  Δmonth% ≤ −8.0% и |Δmonth| ≥ 8000 → +2\n\n"
+        "B) Подписчики vs ER/охват (0–3)\n"
+        "  • avg_reach/members < 0.04 → +3\n"
+        "  • avg_reach/members < 0.08 → +1.5\n"
+        "  • ER < 5% → +1.5; ER < 8% → +0.8\n\n"
+        "C) Ровность просмотров (0–1.5)\n"
+        "  • CV < 0.15 → +1.5; CV < 0.22 → +0.8\n\n"
+        "D) Пересылки (0–1)\n"
+        "  • охват ≥ 20k и пересылок ≤ 1 → +1\n\n"
+        "E) ER/reach sanity (0–0.5)\n"
+        "  • охват/подписчики < 0.03 и ER > 20% → +0.5\n\n"
+        "Event-based floor\n"
+        "  • если Telemetr пометил канал как подозрительный → риск минимум 8/10"
+    )
+
+
+def _try_get_posts_reaches(channel_id: str, limit: int = 20) -> List[int]:
+    """
+    Пытаемся взять охваты постов.
+    Если API не отдаёт, просто возвращаем [] (скоринг без блока C).
+    """
+    # В доках есть /channels/posts (и /channels/posts/get/search),
+    # но структура может отличаться. Мы максимально “не ломаемся”.
+    try:
+        data = telemetr_get("/channels/posts", {"channelId": channel_id, "limit": limit, "offset": 0})
+        resp = data.get("response") or {}
+        items = resp.get("items") or []
+        reaches = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            stats = it.get("stats") or {}
+            # stats может быть dict или строка/что-то ещё
+            if isinstance(stats, dict):
+                views = stats.get("views")
+                if views is not None:
+                    reaches.append(safe_int(views, 0))
+        return [x for x in reaches if x > 0]
+    except Exception:
+        return []
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -564,64 +475,59 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не распознала канал 😕 Пришли ссылку вида https://t.me/username или @username.")
         return
 
+    # 1) берём базовую статистику
     try:
-        # Network calls in a thread so we don't block asyncio loop
-        stat: ChannelStat = await asyncio.to_thread(fetch_channel_stat, channel_id)
-        subs_series: List[dict] = await asyncio.to_thread(fetch_subscribers_series, channel_id, 30)
-
-        day_delta, week_delta, month_delta = compute_deltas_from_series(subs_series)
-
-        # Event-based rule (Telemetr moderation flags)
-        suspect_flag, suspect_reason = detect_telemetr_suspect_flag(stat.raw_resp)
-
-        # Build scoring parts
-        parts: List[ScorePart] = []
-        parts.append(score_from_subs_dynamics(stat.members, day_delta, week_delta, month_delta))
-        parts.append(score_reach_vs_subs(stat.members, stat.avg_reach))
-        parts.append(score_er(stat.err_percent))
-        parts.append(score_forward_mentions(stat.forwards_count, stat.mentions_count, stat.members))
-
-        total_points = sum(p.got for p in parts)
-        risk = total_score_to_risk(total_points)
-
-        # event-based floor
-        event_line = ""
-        if suspect_flag:
-            risk = max(risk, 8)
-            event_line = (
-                "\n🚨 Telemetr: канал помечен как подозрительный → риск минимум 8/10\n"
-                f"Причина: {suspect_reason}\n"
-            )
-
-        explanation = build_explanation(parts)
-
-        msg = (
-            f"📊 {stat.title}\n"
-            f"@{stat.username}\n\n"
-            f"👥 Подписчики: {stat.members}\n"
-            f"👀 Средний охват поста: {stat.avg_reach}\n"
-            f"📈 ER: {stat.err_percent:.2f}%\n"
-            f"🔗 CI: {stat.ci_index}\n"
-            f"⭐️ Telemetr rating: {stat.scoring_rate}\n"
-            f"📣 Упоминания: {stat.mentions_count}\n"
-            f"↪️ Пересылки: {stat.forwards_count}\n"
-            f"{event_line}\n"
-            f"⚠️ Вероятность накрутки: {risk}/10\n\n"
-            f"🧠 Разбор (почему такой риск):\n{explanation}\n\n"
-            f"Команда: /weights — пороги и веса"
-        )
-
-        await update.message.reply_text(msg)
-
+        data = telemetr_get("/channels/stat", {"channelId": channel_id})
+    except requests.exceptions.Timeout:
+        await update.message.reply_text("⏳ Telemetr временно не отвечает.\nПопробуй ещё раз через минуту.")
+        return
     except requests.HTTPError as e:
         await update.message.reply_text(f"Ошибка Telemetr API:\n{e}")
+        return
     except Exception as e:
         await update.message.reply_text(f"Неожиданная ошибка:\n{e}")
+        return
+
+    resp = data.get("response", {}) or {}
+    title = resp.get("title") or channel_id
+    username = resp.get("username") or channel_id
+
+    members = safe_int(resp.get("participants_count"), 0)
+    avg_reach = safe_int(resp.get("avg_post_reach"), 0)
+    err_percent = safe_float(resp.get("err_percent"), 0.0)
+    ci_index = resp.get("ci_index", 0)
+    scoring_rate = resp.get("scoring_rate", 0)
+
+    # дополнительно (могут быть)
+    mentions = safe_int(resp.get("mentions_count") or resp.get("mentions") or 0)
+    forwards = safe_int(resp.get("forwards_count") or resp.get("forwards") or 0)
+
+    # 2) достаём охваты постов (если получится) — для блока "ровность"
+    post_reaches = _try_get_posts_reaches(channel_id, limit=20)
+
+    # 3) скоринг + разбор
+    risk, breakdown = build_scoring_breakdown(resp, post_reaches)
+
+    # 4) ответ
+    msg = (
+        f"📊 {title}\n"
+        f"@{username}\n\n"
+        f"👥 Подписчики: {members}\n"
+        f"👀 Средний охват поста: {avg_reach}\n"
+        f"📈 ER: {err_percent:.2f}%\n"
+        f"🔗 CI: {ci_index}\n"
+        f"⭐️ Telemetr rating: {scoring_rate}\n"
+    )
+    if mentions:
+        msg += f"📣 Упоминания: {mentions}\n"
+    if forwards:
+        msg += f"↪️ Пересылки: {forwards}\n"
+
+    msg += f"\n⚠️ Вероятность накрутки: {risk}/10\n\n{breakdown}"
+
+    await update.message.reply_text(msg)
 
 
-# =========================
-# Main
-# =========================
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is missing")
@@ -631,11 +537,9 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(CommandHandler("weights", cmd_weights))
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Important for stability when load grows:
-    # - drop_pending_updates avoids huge backlog after restarts
-    # (ptb v20 supports it via run_polling argument)
     app.run_polling(drop_pending_updates=True)
 
 
