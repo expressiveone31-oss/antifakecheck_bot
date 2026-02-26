@@ -1,28 +1,47 @@
 import os
 import logging
+import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 from openai import OpenAI
 
-# Настройка логирования
+# 1. Настройка логирования
 logging.basicConfig(
-    format='%(asctime) - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Загрузка переменных окружения (в Railway они подтянутся сами)
+# 2. Переменные окружения (подтягиваются из Railway)
 TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEMETR_TOKEN = os.getenv("TELEMETR_TOKEN")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-async def ask_gpt_expert(prompt):
-    """Отправка данных в GPT-4o-mini для анализа"""
+def get_telemetr_data(channel_id):
+    """Получение статистики канала напрямую из Telemetr API"""
+    url = f"https://api.telemetr.me/v1/channels/stat-full/{channel_id}/"
+    headers = {"Authorization": f"Token {TELEMETR_TOKEN}"}
     try:
-        # Обрезаем входные данные, чтобы не "уронить" бота на больших каналах
-        safe_prompt = str(prompt)[:3500] 
+        response = requests.get(url, headers=headers, timeout=15)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            logger.error(f"Telemetr API error: {response.status_code}")
+            return None
+    except Exception as e:
+        logger.error(f"Telemetr request failed: {e}")
+        return None
+
+async def ask_gpt_expert(data_payload):
+    """Отправка очищенных данных в GPT для анализа"""
+    if not data_payload:
+        return "Недостаточно данных для точного вердикта."
+
+    try:
+        # Обрезаем лишнее, чтобы бот не падал на больших каналах (Мэш и др.)
+        safe_prompt = str(data_payload)[:3500] 
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -34,8 +53,8 @@ async def ask_gpt_expert(prompt):
                         "ПРАВИЛА АНАЛИЗА:\n"
                         "1. ERR (охват) 10–30% — это НОРМА. ERR выше 30% — это ОТЛИЧНО. Никогда не называй высокий ERR накруткой.\n"
                         "2. Считай математически верно: 33% — это БОЛЬШЕ, чем 5%. Если охват высокий, это признак качества.\n"
-                        "3. Признаки накрутки: резкие скачки подписчиков без упоминаний, ERR ниже 2%.\n"
-                        "4. Если данных мало, пиши: 'Недостаточно данных для точного вердикта'.\n"
+                        "3. Признаки накрутки: резкие скачки подписчиков без упоминаний в других каналах, ERR ниже 2%.\n"
+                        "4. Если данных в отчете мало, пиши: 'Недостаточно данных для точного вердикта'.\n"
                         "5. Формат ответа: РЕЗЮМЕ (1 предл.), РИСКИ (есть/нет), ОБОСНОВАНИЕ (цифры), ОЦЕНКА (от 1 до 10)."
                     )
                 },
@@ -46,51 +65,40 @@ async def ask_gpt_expert(prompt):
         return response.choices[0].message.content
     except Exception as e:
         logger.error(f"GPT Error: {e}")
-        return f"Ошибка при обращении к нейросети: {str(e)}"
+        return f"Ошибка нейросети: {str(e)}"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка команды /start"""
-    await update.message.reply_text("Привет! Пришли мне ссылку на канал (например, @username), и я проверю его на накрутки.")
+    """Команда /start"""
+    await update.message.reply_text("Пришли мне @username канала, и я проверю его статистику через Telemetr + GPT.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Основная логика обработки сообщений"""
+    """Обработка ссылки на канал"""
     text = update.message.text
-    if not text:
-        return
+    if not text: return
 
-    # Извлекаем username/ID канала
-    cid = text.replace("https://t.me/", "").replace("@", "").strip()
+    # Очищаем юзернейм
+    cid = text.replace("https://t.me/", "").replace("@", "").strip().split('/')[0]
     
-    status_msg = await update.message.reply_text(f"🧠 GPT-аналитик проверяет @{cid} на вшивость...")
+    status_msg = await update.message.reply_text(f"🧠 GPT-аналитик проверяет @{cid}...")
 
     try:
-        # Здесь должна быть твоя функция получения данных из Telemetr
-        # Для примера представим, что мы получили raw_payload
-        # raw_payload = get_telemetr_data(cid) 
+        # Получаем реальные данные
+        raw_payload = get_telemetr_data(cid)
         
-        # ВАЖНО: Убедись, что твоя функция get_telemetr_data определена выше или импортирована!
-        # Если ее нет, бот выдаст ошибку.
-        
-        # Передаем данные в GPT
-        # verdict = await ask_gpt_expert(raw_payload)
-        
-        # ВРЕМЕННАЯ ЗАГЛУШКА (замени на реальный вызов Telemetr, когда будешь готова)
-        verdict = await ask_gpt_expert(f"Данные для канала {cid} из Telemetr...")
+        # Анализируем через GPT
+        verdict = await ask_gpt_expert(raw_payload)
 
-        # Отправляем финальный ответ (без parse_mode во избежание ошибок разметки)
+        # Отправляем финальный текст БЕЗ parse_mode (чтобы не было ошибок разметки)
         await status_msg.edit_text(f"✅ Анализ завершен для @{cid}:\n\n{verdict}")
 
     except Exception as e:
-        logger.error(f"Handle Message Error: {e}")
-        await status_msg.edit_text("❌ Ошибка при запросе к API. Проверь правильность ссылки или токены.")
+        logger.error(f"Handle error: {e}")
+        await status_msg.edit_text("❌ Произошла ошибка. Проверь токен Telemetr или доступность API.")
 
 if __name__ == '__main__':
     application = ApplicationBuilder().token(TOKEN).build()
     
-    start_handler = CommandHandler('start', start)
-    msg_handler = MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message)
-    
-    application.add_handler(start_handler)
-    application.add_handler(msg_handler)
+    application.add_handler(CommandHandler('start', start))
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     
     application.run_polling()
