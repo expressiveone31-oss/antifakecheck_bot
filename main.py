@@ -3,98 +3,75 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Данные из окружения
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 TELEMETR_TOKEN = os.environ.get("TELEMETR_TOKEN", "").strip()
 BASE_URL = "https://api.telemetr.me"
 
+# --- ШАГ 2: СЕРВЕРНАЯ ЛОГИКА (ВЕСА И АНАЛИЗ) ---
+
 def calculate_cv(values):
-    """Считает коэффициент вариации (разброс просмотров)."""
-    # Убираем аномально низкие значения (1-5 просмотров), чтобы не портить статистику
     clean_v = [v for v in values if v is not None and v > 10]
     if len(clean_v) < 5: return None
-    
     avg = sum(clean_v) / len(clean_v)
-    if avg == 0: return 0
     variance = sum((x - avg) ** 2 for x in clean_v) / len(clean_v)
     return math.sqrt(variance) / avg
 
-def compute_risk(st, views, del_recent):
-    """Основная логика оценки по твоим параметрам."""
+def run_server_analysis(raw_data):
+    """
+    Тот самый 'сервер', который прогоняет сырые данные по весам.
+    """
+    st = raw_data.get("stats", {})
+    views = raw_data.get("views", [])
+    del_recent = raw_data.get("deleted_count", 0)
+    
     blocks = []
     
-    # Извлекаем переменные
-    members = st.get("participants_count") or 0
-    reach = st.get("avg_post_reach") or 0
-    mentions = st.get("mentions_count") or 0
-    growth = st.get("participants_count_growth_week") or 0
-    # Telemetr scoring_rate обычно 0.0 - 10.0, приводим к 100-балльной для фильтра
-    raw_rate = st.get("scoring_rate") or 0
-    rate = raw_rate * 10 if raw_rate <= 10 else raw_rate
-
-    # 1. ТРАФИК И РОСТ (Макс 4.0)
+    # 1. Трафик
     s1, b1 = 0.0, []
-    if growth and growth > 400 and mentions < 5:
+    growth = st.get("participants_count_growth_week") or 0
+    mentions = st.get("mentions_count") or 0
+    reach = st.get("avg_post_reach") or 0
+    
+    if growth > 400 and mentions < 5:
         s1 += 4.0
-        b1.append(f"🚨 Аномальный рост: +{growth} саб/нед при {mentions} упом.")
+        b1.append(f"🚨 Аномальный рост: +{growth} за неделю")
     elif reach > 1000 and mentions < 3:
         s1 += 1.5
-        b1.append("⚠️ Высокий охват без внешних упоминаний")
-    
-    # Виральность
-    if mentions > 0:
-        eff = reach / mentions
-        if eff > 5000 and reach > 2000:
-            s1 += 1.0
-            b1.append(f"Подозрительный выхлоп: {eff:.0f} охвата на 1 упом.")
-    
-    blocks.append({"t": "Трафик", "s": min(4.0, s1), "l": b1 or ["Источники выглядят ок"]})
+        b1.append("⚠️ Охват без упоминаний")
+    blocks.append({"t": "Трафик", "s": min(4.0, s1), "l": b1 or ["Ок"]})
 
-    # 2. КОНТЕНТ (CV + УДАЛЕНИЯ, Макс 4.0)
+    # 2. Контент
     s2, b2 = 0.0, []
     cv = calculate_cv(views)
     if cv is not None:
-        if cv < 0.12: # "Забор"
-            s2 += 3.5
-            b2.append(f"🚨 Критическая ровность (CV: {cv:.2f})")
-        elif cv < 0.18: # "Докрутка"
-            s2 += 1.5
-            b2.append(f"⚠️ Подозрительная ровность (CV: {cv:.2f})")
-        else:
-            b2.append(f"Органика (CV: {cv:.2f})")
-    
-    if del_recent > 3:
-        s2 += 1.0
-        b2.append(f"Удалено {del_recent} постов (заметание следов)")
-        
-    blocks.append({"t": "Контент", "s": min(4.0, s2), "l": b2 or ["Нет данных по постам"]})
+        if cv < 0.12: s2 += 3.5; b2.append(f"🚨 Забор (CV: {cv:.2f})")
+        elif cv < 0.18: s2 += 1.5; b2.append(f"⚠️ Подозрительно ровно (CV: {cv:.2f})")
+    if del_recent > 3: s2 += 1.0; b2.append(f"Удалено постов: {del_recent}")
+    blocks.append({"t": "Контент", "s": min(4.0, s2), "l": b2 or ["Ок"]})
 
-    # 3. БАЗА (Порог 5%, Макс 2.0)
+    # 3. База
     s3, b3 = 0.0, []
+    members = st.get("participants_count") or 0
     if members > 500:
         ratio = reach / members
-        if ratio < 0.05:
-            s3 += 2.0
-            b3.append(f"🚨 Мертвая база: охват {ratio:.1%} (порог 5%)")
-        else:
-            b3.append(f"Активность аудитории: {ratio:.1%}")
-            
-    blocks.append({"t": "База", "s": s3, "l": b3 or ["Мало данных для оценки базы"]})
+        if ratio < 0.05: s3 += 2.0; b3.append(f"🚨 Мертвая база: {ratio:.1%}")
+    blocks.append({"t": "База", "s": s3, "l": b3 or ["Ок"]})
 
-    # ИТОГОВЫЙ БАЛЛ (Дробный, без округления до целого)
     total_risk = round(sum(b['s'] for b in blocks), 1)
     
-    # Фильтр Telemetr (Принудительный риск 7.0 если траст низкий)
-    floor_active = False
-    if 0 < rate < 48 and total_risk < 7.0:
+    # Фильтр Telemetr
+    rate = st.get("scoring_rate", 0)
+    # Если рейтинг в 10-балльной шкале, переводим
+    t_rate = rate * 10 if rate <= 10 else rate
+    if 0 < t_rate < 48 and total_risk < 7.0:
         total_risk = 7.0
-        floor_active = True
+        
+    return total_risk, blocks, t_rate
 
-    return total_risk, blocks, floor_active, rate
+# --- ШАГ 1: СБОР СЫРЫХ ДАННЫХ ---
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = re.search(r"(?:t\.me/|@)?([A-Za-z0-9_]{5,})", update.message.text or "")
@@ -102,68 +79,60 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = m.group(1)
     h = {"Authorization": f"Bearer {TELEMETR_TOKEN}"}
 
-    try:
-        # ШАГ 1: Статистика (3 попытки с прогревом)
-        st = {}
-        for attempt in range(3):
-            try:
-                r = requests.get(f"{BASE_URL}/channels/stat", headers=h, params={"channelId": cid}, timeout=10).json()
-                st = r.get("response", {})
-                if st and st.get("participants_count") is not None:
-                    break
-            except: pass
-            time.sleep(3 + attempt)
+    status_msg = await update.message.reply_text(f"🔍 *Анализ {cid}*:\n⏳ Сбор данных...", parse_mode=ParseMode.MARKDOWN)
 
-        if not st or st.get("participants_count") is None:
-            await update.message.reply_text(f"⚠️ Telemetr не отдал базовую стат по @{cid}. Канал может быть не проиндексирован.")
+    raw_payload = {"stats": {}, "views": [], "deleted_count": 0}
+
+    try:
+        # 1. Запрос MAIN_STATS
+        for i in range(3):
+            r = requests.get(f"{BASE_URL}/channels/stat", headers=h, params={"channelId": cid}, timeout=10).json()
+            if r.get("response"):
+                raw_payload["stats"] = r["response"]
+                break
+            time.sleep(2)
+        
+        if not raw_payload["stats"]:
+            await status_msg.edit_text(f"❌ API Telemetr не отдало статистику по @{cid}.\nПопробуй скинуть ссылку еще раз через минуту.")
             return
 
-        # ШАГ 2: Посты (не падаем, если их нет)
-        ps = []
+        await status_msg.edit_text(f"🔍 *Анализ {cid}*:\n✅ Статистика получена\n⏳ Загрузка постов...")
+
+        # 2. Запрос POSTS
         try:
-            ps_r = requests.get(f"{BASE_URL}/channels/posts", headers=h, params={"channelId": cid, "limit": 40}, timeout=10).json()
-            ps = ps_r.get("response", {}).get("items", [])
+            pr = requests.get(f"{BASE_URL}/channels/posts", headers=h, params={"channelId": cid, "limit": 40}, timeout=10).json()
+            items = pr.get("response", {}).get("items", [])
+            for p in items:
+                if p.get("is_deleted"): raw_payload["deleted_count"] += 1
+                v = p.get("views_count") or (p.get("stats") if isinstance(p.get("stats"), dict) else {}).get("views")
+                if v: raw_payload["views"].append(int(v))
         except:
-            logger.warning(f"Не удалось получить посты для {cid}")
-        
-        views, del_cnt = [], 0
-        for p in ps:
-            if p.get("is_deleted"): del_cnt += 1
-            # Ищем просмотры во всех возможных полях
-            v = p.get("views_count")
-            if v is None and isinstance(p.get("stats"), dict):
-                v = p["stats"].get("views")
-            if v is not None:
-                views.append(int(v))
+            logger.error("Посты не получены")
 
-        # ШАГ 3: Расчет
-        risk, blocks, floor, t_rate = compute_risk(st, views, del_cnt)
+        await status_msg.edit_text(f"🔍 *Анализ {cid}*:\n✅ Статистика получена\n✅ Посты получены\n⚙️ Запуск сервера аналитики...")
 
-        # ШАГ 4: Красивый вывод
-        res = [f"📊 *Анализ канала: @{cid}*", f"📈 Итоговый риск: `{risk}/10`", "---"]
+        # ШАГ 2: Передача данных на "сервер" (в нашу функцию анализа)
+        risk, blocks, t_rate = run_server_analysis(raw_payload)
+
+        # ФИНАЛЬНЫЙ ВЫВОД
+        res = [f"📊 *Результат: @{cid}*", f"📈 Риск: `{risk}/10`", "---"]
         for b in blocks:
-            # Иконки для визуальной наглядности
-            icon = "🟢" if b['s'] == 0 else "🟡" if b['s'] < 2 else "🔴"
+            icon = "🟢" if b['s'] == 0 else "🔴" if b['s'] >= 2 else "🟡"
             res.append(f"{icon} *{b['t']}*: `{b['s']:g}`")
-            for line in b['l']:
-                res.append(f"  • {line}")
-            
-        if floor:
-            res.append(f"\n❗ *Внимание:* Траст Telemetr критически низкий ({t_rate:.1f}). Риск поднят до 7.0 автоматически.")
+            for line in b['l']: res.append(f"  • {line}")
+        
+        if risk >= 7.0 and t_rate < 48:
+            res.append(f"\n❗ *Низкий траст Telemetr ({t_rate:.1f})*")
 
-        await update.message.reply_text("\n".join(res), parse_mode=ParseMode.MARKDOWN)
+        await status_msg.edit_text("\n".join(res), parse_mode=ParseMode.MARKDOWN)
 
     except Exception as e:
-        logger.error(f"Ошибка хендлера: {e}")
-        await update.message.reply_text("❌ Произошла ошибка при обработке данных. Попробуйте еще раз.")
+        logger.error(e)
+        await status_msg.edit_text(f"❌ Ошибка системы: {str(e)}")
 
 def main():
-    if not BOT_TOKEN:
-        print("BOT_TOKEN не найден!")
-        return
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.run_polling()
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
