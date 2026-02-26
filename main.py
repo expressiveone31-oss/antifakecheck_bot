@@ -20,9 +20,9 @@ TELEMETR_TOKEN = os.getenv("TELEMETR_TOKEN")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 def get_telemetr_data(channel_id):
-    """Получение статистики канала из Telemetr API (базовый метод)"""
-    # Используем стабильный эндпоинт /stat/ вместо /stat-full/
-    url = f"https://api.telemetr.me/v1/channels/stat/{channel_id}/"
+    """Получение статистики канала через метод поиска по юзернейму"""
+    # МЫ ЗАМЕНИЛИ ЭТУ СТРОКУ: теперь стучимся в правильную "дверь" API
+    url = f"https://api.telemetr.me/v1/channels/by_username/{channel_id}/"
     headers = {"Authorization": f"Token {TELEMETR_TOKEN}"}
     
     try:
@@ -33,8 +33,9 @@ def get_telemetr_data(channel_id):
             return response.json()
         elif response.status_code == 404:
             logger.warning(f"Канал {channel_id} не найден в базе Telemetr.")
-            return {"error": "Channel not found in database"}
+            return {"error": "Channel not found"}
         else:
+            # Логируем текст ошибки, чтобы видеть причину (как те кракозябры в 17:47)
             logger.error(f"Telemetr API error {response.status_code}: {response.text}")
             return None
     except Exception as e:
@@ -43,12 +44,11 @@ def get_telemetr_data(channel_id):
 
 async def ask_gpt_expert(data_payload):
     """Анализ данных через GPT-4o-mini"""
-    # Если данных нет или пришла ошибка, GPT об этом сообщит по нашей инструкции
     if not data_payload or (isinstance(data_payload, dict) and "error" in data_payload):
         return "Недостаточно данных для точного вердикта. Канал может быть новым или отсутствовать в базе Telemetr."
 
     try:
-        # Ограничиваем длину данных (защита для больших каналов вроде Mash)
+        # Защита от перегрузки (обрезаем до 3800 символов)
         safe_prompt = str(data_payload)[:3800] 
 
         response = client.chat.completions.create(
@@ -60,7 +60,7 @@ async def ask_gpt_expert(data_payload):
                         "Ты — эксперт по выявлению накруток в Telegram. Твоя задача: проанализировать цифры.\n\n"
                         "ПРАВИЛА:\n"
                         "1. ERR выше 10% — это ХОРОШО. 30%+ — ОТЛИЧНО. Не называй высокий охват накруткой.\n"
-                        "2. Сравнивай числа верно: 33 > 5. Если охват высокий, это НЕ боты.\n"
+                        "2. Сравнивай числа верно: 33 > 5. Если охват высокий (например, 33%), это НЕ боты, а хороший контент.\n"
                         "3. Признаки ботов: ERR < 2%, резкие скачки подписчиков без внешних упоминаний.\n"
                         "4. Формат ответа: РЕЗЮМЕ, РИСКИ, ОБОСНОВАНИЕ (по цифрам), ОЦЕНКА (1-10)."
                     )
@@ -75,25 +75,25 @@ async def ask_gpt_expert(data_payload):
         return f"Ошибка нейросети: {str(e)}"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Пришли мне @username канала для проверки.")
+    await update.message.reply_text("Пришли мне @username канала для проверки через Telemetr.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if not text: return
 
-    # Улучшенная очистка: убираем всё, оставляем только чистый юзернейм
+    # Очищаем юзернейм от ссылок и лишних знаков
     clean_id = text.replace("https://t.me/", "").replace("@", "").strip().split('/')[0].split('?')[0]
     
     status_msg = await update.message.reply_text(f"🧠 GPT анализирует @{clean_id}...")
 
     try:
-        # 1. Получаем данные
+        # 1. Получаем данные по юзернейму
         raw_payload = get_telemetr_data(clean_id)
         
-        # 2. Просим GPT вынести вердикт
+        # 2. Передаем их в GPT
         verdict = await ask_gpt_expert(raw_payload)
 
-        # 3. Отправляем результат (без parse_mode для надежности)
+        # 3. Отправляем финальный ответ
         await status_msg.edit_text(f"✅ Анализ завершен для @{clean_id}:\n\n{verdict}")
 
     except Exception as e:
