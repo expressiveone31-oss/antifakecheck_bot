@@ -90,7 +90,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 3. Анализ GPT
         verdict = await ask_gpt_expert(raw_payload)
         
-     await status_msg.edit_text(f"✅ Анализ завершен для @{cid}:\n\n{verdict}")
+        await status_msg.edit_text(f"✅ Анализ завершен для @{cid}:\n\n{verdict}")
 
     except Exception as e:
         logger.error(e)
