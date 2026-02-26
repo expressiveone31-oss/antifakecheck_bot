@@ -21,7 +21,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 def get_telemetr_data(channel_id):
     """Получение статистики канала напрямую из Telemetr API"""
-    url = f"https://api.telemetr.me/v1/channels/stat-full/{channel_id}/"
+    url = f"https://api.telemetr.me/v1/channels/stat/{channel_id}/"
     headers = {"Authorization": f"Token {TELEMETR_TOKEN}"}
     try:
         response = requests.get(url, headers=headers, timeout=15)
