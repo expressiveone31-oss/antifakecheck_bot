@@ -12,7 +12,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 2. Переменные окружения (подтягиваются из Railway)
+# 2. Переменные окружения
 TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEMETR_TOKEN = os.getenv("TELEMETR_TOKEN")
@@ -20,28 +20,36 @@ TELEMETR_TOKEN = os.getenv("TELEMETR_TOKEN")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 def get_telemetr_data(channel_id):
-    """Получение статистики канала напрямую из Telemetr API"""
+    """Получение статистики канала из Telemetr API (базовый метод)"""
+    # Используем стабильный эндпоинт /stat/ вместо /stat-full/
     url = f"https://api.telemetr.me/v1/channels/stat/{channel_id}/"
     headers = {"Authorization": f"Token {TELEMETR_TOKEN}"}
+    
     try:
         response = requests.get(url, headers=headers, timeout=15)
+        logger.info(f"Запрос к Telemetr для {channel_id}. Статус: {response.status_code}")
+        
         if response.status_code == 200:
             return response.json()
+        elif response.status_code == 404:
+            logger.warning(f"Канал {channel_id} не найден в базе Telemetr.")
+            return {"error": "Channel not found in database"}
         else:
-            logger.error(f"Telemetr API error: {response.status_code}")
+            logger.error(f"Telemetr API error {response.status_code}: {response.text}")
             return None
     except Exception as e:
-        logger.error(f"Telemetr request failed: {e}")
+        logger.error(f"Ошибка при запросе к Telemetr: {e}")
         return None
 
 async def ask_gpt_expert(data_payload):
-    """Отправка очищенных данных в GPT для анализа"""
-    if not data_payload:
-        return "Недостаточно данных для точного вердикта."
+    """Анализ данных через GPT-4o-mini"""
+    # Если данных нет или пришла ошибка, GPT об этом сообщит по нашей инструкции
+    if not data_payload or (isinstance(data_payload, dict) and "error" in data_payload):
+        return "Недостаточно данных для точного вердикта. Канал может быть новым или отсутствовать в базе Telemetr."
 
     try:
-        # Обрезаем лишнее, чтобы бот не падал на больших каналах (Мэш и др.)
-        safe_prompt = str(data_payload)[:3500] 
+        # Ограничиваем длину данных (защита для больших каналов вроде Mash)
+        safe_prompt = str(data_payload)[:3800] 
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -49,16 +57,15 @@ async def ask_gpt_expert(data_payload):
                 {
                     "role": "system",
                     "content": (
-                        "Ты — топовый аналитик Telegram-каналов. Твоя задача: отличить живой канал от накрученного ботами.\n\n"
-                        "ПРАВИЛА АНАЛИЗА:\n"
-                        "1. ERR (охват) 10–30% — это НОРМА. ERR выше 30% — это ОТЛИЧНО. Никогда не называй высокий ERR накруткой.\n"
-                        "2. Считай математически верно: 33% — это БОЛЬШЕ, чем 5%. Если охват высокий, это признак качества.\n"
-                        "3. Признаки накрутки: резкие скачки подписчиков без упоминаний в других каналах, ERR ниже 2%.\n"
-                        "4. Если данных в отчете мало, пиши: 'Недостаточно данных для точного вердикта'.\n"
-                        "5. Формат ответа: РЕЗЮМЕ (1 предл.), РИСКИ (есть/нет), ОБОСНОВАНИЕ (цифры), ОЦЕНКА (от 1 до 10)."
+                        "Ты — эксперт по выявлению накруток в Telegram. Твоя задача: проанализировать цифры.\n\n"
+                        "ПРАВИЛА:\n"
+                        "1. ERR выше 10% — это ХОРОШО. 30%+ — ОТЛИЧНО. Не называй высокий охват накруткой.\n"
+                        "2. Сравнивай числа верно: 33 > 5. Если охват высокий, это НЕ боты.\n"
+                        "3. Признаки ботов: ERR < 2%, резкие скачки подписчиков без внешних упоминаний.\n"
+                        "4. Формат ответа: РЕЗЮМЕ, РИСКИ, ОБОСНОВАНИЕ (по цифрам), ОЦЕНКА (1-10)."
                     )
                 },
-                {"role": "user", "content": safe_prompt}
+                {"role": "user", "content": f"Проанализируй данные канала: {safe_prompt}"}
             ],
             temperature=0
         )
@@ -68,37 +75,33 @@ async def ask_gpt_expert(data_payload):
         return f"Ошибка нейросети: {str(e)}"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /start"""
-    await update.message.reply_text("Пришли мне @username канала, и я проверю его статистику через Telemetr + GPT.")
+    await update.message.reply_text("Пришли мне @username канала для проверки.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка ссылки на канал"""
     text = update.message.text
     if not text: return
 
-    # Очищаем юзернейм
-    cid = text.replace("https://t.me/", "").replace("@", "").strip().split('/')[0]
+    # Улучшенная очистка: убираем всё, оставляем только чистый юзернейм
+    clean_id = text.replace("https://t.me/", "").replace("@", "").strip().split('/')[0].split('?')[0]
     
-    status_msg = await update.message.reply_text(f"🧠 GPT-аналитик проверяет @{cid}...")
+    status_msg = await update.message.reply_text(f"🧠 GPT анализирует @{clean_id}...")
 
     try:
-        # Получаем реальные данные
-        raw_payload = get_telemetr_data(cid)
+        # 1. Получаем данные
+        raw_payload = get_telemetr_data(clean_id)
         
-        # Анализируем через GPT
+        # 2. Просим GPT вынести вердикт
         verdict = await ask_gpt_expert(raw_payload)
 
-        # Отправляем финальный текст БЕЗ parse_mode (чтобы не было ошибок разметки)
-        await status_msg.edit_text(f"✅ Анализ завершен для @{cid}:\n\n{verdict}")
+        # 3. Отправляем результат (без parse_mode для надежности)
+        await status_msg.edit_text(f"✅ Анализ завершен для @{clean_id}:\n\n{verdict}")
 
     except Exception as e:
-        logger.error(f"Handle error: {e}")
-        await status_msg.edit_text("❌ Произошла ошибка. Проверь токен Telemetr или доступность API.")
+        logger.error(f"Ошибка в handle_message: {e}")
+        await status_msg.edit_text("❌ Произошла ошибка. Попробуй позже.")
 
 if __name__ == '__main__':
     application = ApplicationBuilder().token(TOKEN).build()
-    
     application.add_handler(CommandHandler('start', start))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    
     application.run_polling()
