@@ -3,6 +3,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 from openai import OpenAI
 
+# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -12,44 +13,50 @@ TELEMETR_TOKEN = os.getenv("TELEMETR_TOKEN")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 def get_telemetr_data(username):
+    # Пытаемся найти канал через общий поиск (он стабильнее всего)
     url = "https://api.telemetr.me/v1/channels/"
     headers = {"Authorization": f"Token {TELEMETR_TOKEN}"}
+    params = {"username": username}
+    
     try:
-        # Пробуем поиск по юзернейму
-        res = requests.get(url, headers=headers, params={"username": username}, timeout=10)
+        res = requests.get(url, headers=headers, params=params, timeout=10)
         if res.status_code == 200:
             data = res.json()
-            return data["results"][0] if data.get("results") else None
-        return f"Error_{res.status_code}"
-    except: return None
+            # Если результаты есть, берем самый подходящий
+            if data.get("results") and len(data["results"]) > 0:
+                return data["results"][0]
+        return None
+    except Exception as e:
+        logger.error(f"Ошибка API: {e}")
+        return None
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    if not text or len(text) > 100: return
+    if not text: return
     
+    # Чистим юзернейм от лишнего
     clean_id = text.replace("https://t.me/", "").replace("@", "").strip().split('/')[0]
-    status_msg = await update.message.reply_text(f"⏳ Жду ответа от Telemetr по @{clean_id}...")
+    status_msg = await update.message.reply_text(f"🔍 Ищу @{clean_id} в базе Telemetr...")
 
     raw_data = get_telemetr_data(clean_id)
 
-    if raw_data == "Error_500":
-        await status_msg.edit_text("❌ Сервер Telemetr временно недоступен (Ошибка 500). Я сообщу, когда они починят API!")
-        return
-    elif not raw_data:
-        await status_msg.edit_text("❓ Данные не найдены. Возможно, канал слишком новый.")
+    if not raw_data:
+        await status_msg.edit_text(f"❌ Канал @{clean_id} не найден в Telemetr. Возможно, он скрыт или слишком мал.")
         return
 
-    # Если данные пришли (API ожил), зовем GPT
+    # Если данные есть, просим GPT сделать короткий и четкий вердикт
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "system", "content": "Ты аналитик TG. Проверь данные на накрутку."},
-                      {"role": "user", "content": str(raw_data)[:3500]}],
+            messages=[
+                {"role": "system", "content": "Ты эксперт по Telegram. Проанализируй данные на накрутку (ERR, динамика). Пиши кратко и по делу."},
+                {"role": "user", "content": f"Данные канала: {str(raw_data)[:3500]}"}
+            ],
             temperature=0
         )
-        await status_msg.edit_text(f"✅ Анализ @{clean_id}:\n\n{response.choices[0].message.content}")
+        await status_msg.edit_text(f"✅ **Анализ @{clean_id}:**\n\n{response.choices[0].message.content}")
     except Exception as e:
-        await status_msg.edit_text(f"❌ Ошибка нейросети: {e}")
+        await status_msg.edit_text("❌ Ошибка при анализе текста.")
 
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TOKEN).build()
