@@ -1,72 +1,107 @@
 import os
 import logging
 import requests
+import json
 from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 from openai import OpenAI
 
+# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Загрузка переменных окружения из Railway
 TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEMETR_TOKEN = os.getenv("TELEMETR_TOKEN")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# Инициализация OpenAI с проверкой ключа
+if not OPENAI_API_KEY:
+    logger.error("ОШИБКА: OPENAI_API_KEY не установлен в переменных Railway!")
+    client = None
+else:
+    client = OpenAI(api_key=OPENAI_API_KEY)
 
-def get_telemetr_data(username):
-    """Самый стабильный метод: поиск канала по юзернейму"""
-    # Используем поиск (channels), он не выдает 500 как метод by_username
-    url = "https://api.telemetr.me/v1/channels/"
-    params = {"username": username}
-    headers = {"Authorization": f"Token {TELEMETR_TOKEN}"}
+def get_telemetr_data(channel_link):
+    """
+    Используем новый эндпоинт от поддержки: https://api.telemetr.me/channels/get
+    """
+    url = "https://api.telemetr.me/channels/get"
+    
+    # Поддержка часто требует X-Api-Token или стандартный Authorization
+    headers = {
+        "X-Api-Token": TELEMETR_TOKEN,
+        "Content-Type": "application/json"
+    }
+    
+    # Отправляем запрос согласно новым вводным
+    payload = {"link": channel_link}
     
     try:
-        response = requests.get(url, headers=headers, params=params, timeout=15)
+        response = requests.post(url, headers=headers, json=payload, timeout=15)
+        
         if response.status_code == 200:
-            data = response.json()
-            # Если в списке результатов что-то есть — берем первый канал
-            if data.get("results"):
-                return data["results"][0]
-            return {"error": "Канал не найден в базе"}
-        return {"error": f"API Error {response.status_code}"}
+            return response.json()
+        else:
+            logger.error(f"Telemetr Error {response.status_code}: {response.text}")
+            return f"Error_{response.status_code}"
     except Exception as e:
-        return {"error": str(e)}
-
-async def ask_gpt_expert(payload):
-    if "error" in payload:
-        return f"Ошибка данных: {payload['error']}. Попробуй позже."
-
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Ты аналитик Telegram. Проверь данные на накрутку. ERR > 10% - ок. Считай математически верно. Формат: Вердикт, Обоснование, Оценка."},
-                {"role": "user", "content": f"Данные: {str(payload)[:3500]}"}
-            ],
-            temperature=0
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        return f"Ошибка GPT: {e}"
+        logger.error(f"Request failed: {e}")
+        return None
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    if not text: return
-    
-    # Чистим ник
-    clean_id = text.replace("https://t.me/", "").replace("@", "").strip().split('/')[0]
-    status_msg = await update.message.reply_text(f"🔍 Ищу и анализирую @{clean_id}...")
+    if not text or len(text) > 150: 
+        return
 
-    # Получаем данные через СТАБИЛЬНЫЙ поиск
-    data = get_telemetr_data(clean_id)
-    
-    # Анализируем
-    verdict = await ask_gpt_expert(data)
-    
-    await status_msg.edit_text(f"✅ Результат для @{clean_id}:\n\n{verdict}")
+    # Очищаем ввод: если это не ссылка, превращаем в ссылку для API
+    clean_input = text.strip()
+    if not clean_input.startswith("http"):
+        # Убираем собачку, если она есть
+        handle = clean_input.replace("@", "")
+        clean_input = f"https://t.me/{handle}"
+
+    status_msg = await update.message.reply_text(f"📡 Запрашиваю данные для {clean_input}...")
+
+    # Получаем данные от Telemetr
+    raw_data = get_telemetr_data(clean_input)
+
+    if raw_data == "Error_404":
+        await status_msg.edit_text("❌ Эндпоинт не найден. Пожалуйста, проверь правильность API-ключа.")
+        return
+    elif raw_data == "Error_500":
+        await status_msg.edit_text("⚠️ Сервер Telemetr выдал 500. Похоже, их новый эндпоинт тоже нестабилен.")
+        return
+    elif not raw_data:
+        await status_msg.edit_text("❓ Не удалось получить данные от Telemetr.")
+        return
+
+    # Если данные пришли, отправляем их в GPT
+    if client:
+        try:
+            analysis_prompt = (
+                "Ты профессиональный аналитик Telegram-каналов. Проверь данные на признаки накрутки: "
+                "аномальный рост, низкий ERR, подозрительные охваты. Сделай краткий и жесткий вердикт.\n\n"
+                f"ДАННЫЕ: {json.dumps(raw_data, ensure_ascii=False)[:3500]}"
+            )
+            
+            completion = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": analysis_prompt}],
+                temperature=0.2
+            )
+            await status_msg.edit_text(f"✅ **Анализ завершен:**\n\n{completion.choices[0].message.content}")
+        except Exception as e:
+            logger.error(f"GPT Error: {e}")
+            await status_msg.edit_text("❌ Ошибка при генерации анализа нейросетью.")
+    else:
+        await status_msg.edit_text(f"📊 Данные получены, но OpenAI не настроен.\nСырой ответ: `{raw_data}`")
 
 if __name__ == '__main__':
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    app.run_polling()
+    if not TOKEN:
+        print("Критическая ошибка: BOT_TOKEN не найден!")
+    else:
+        app = ApplicationBuilder().token(TOKEN).build()
+        app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+        print("Бот запущен...")
+        app.run_polling()
