@@ -2,6 +2,7 @@ import os
 import logging
 import requests
 import json
+import statistics
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 from openai import OpenAI
@@ -15,36 +16,46 @@ TGSTAT_TOKEN = os.getenv("TGSTAT_TOKEN")
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-def get_engagement_context(subs, err):
-    """Математическая матрица адекватности ERR с защитой от нулевых значений"""
-    if not err or err == 0:
-        return f"Размер: {subs} сабов. Данные по ERR отсутствуют или равны 0. Требуется ручной анализ охватов."
+def analyze_patterns(posts):
+    """Математический анализ последних постов на накрутку"""
+    reaches = [p.get('view_count', 0) for p in posts if not p.get('is_deleted')]
+    forwards = [p.get('forward_count', 0) for p in posts]
     
-    if subs < 10000:
-        expect, status = "20-60%", ("АВТОРСКИЙ" if err > 20 else "НИЗКИЙ")
-    elif 10000 <= subs < 100000:
-        expect, status = "10-30%", ("ОРГАНИКА" if err > 8 else "ПОДОЗРИТЕЛЬНО НИЗКИЙ")
-    elif 100000 <= subs < 500000:
-        expect, status = "5-15%", ("МЕДИА" if err > 4 else "ВЯЛЫЙ")
-    else:
-        expect, status = "2-8%", ("ГИГАНТ" if err > 1.5 else "НИЗКИЙ")
+    if len(reaches) < 5: return "Мало данных для CV", 0
     
-    return f"Размер: {subs} сабов. Ожидаемый ERR: {expect}. Текущий ERR: {err}%. Статус: {status}."
+    # 1. Считаем Коэффициент Вариации (CV) - проверка на 'стерильность'
+    mean_reach = statistics.mean(reaches)
+    stdev_reach = statistics.stdev(reaches)
+    cv = (stdev_reach / mean_reach) * 100 if mean_reach > 0 else 0
+    
+    # 2. Считаем баллы (шкала 0-10)
+    score = 0
+    reasons = []
+    
+    if cv < 2: # Слишком ровно
+        score += 4
+        reasons.append(f"Стерильность (CV: {round(cv, 2)}%): Просмотры подозрительно ровные.")
+    elif cv > 50: # Очень хаотично (обычно органика)
+        score -= 1
+        reasons.append("Живой хаос: Охваты скачут, как у автора.")
+
+    avg_forwards = statistics.mean(forwards)
+    if avg_forwards < 1 and mean_reach > 1000:
+        score += 3
+        reasons.append("Нулевая виральность: Посты смотрят, но не пересылают.")
+    
+    return reasons, score
 
 def get_tgstat_data(channel_id):
-    url = "https://api.tgstat.ru/channels/stat"
-    params = {"token": TGSTAT_TOKEN, "channelId": channel_id}
+    # Используем эндпоинт постов для анализа динамики (последние 20 штук)
+    url = "https://api.tgstat.ru/posts/list"
+    params = {"token": TGSTAT_TOKEN, "channelId": channel_id, "limit": 20}
     try:
         response = requests.get(url, params=params, timeout=15)
         if response.status_code == 200:
             data = response.json()
             if data.get("status") == "ok":
-                res = data.get('response', {})
-                # НОРМАЛИЗАЦИЯ: TGStat может отдавать ERR в разных полях
-                # Пробуем вытащить хоть какое-то значение вовлеченности
-                res['err_fixed'] = res.get('err') or res.get('err_percent') or res.get('avg_post_reach', 0) / res.get('participants_count', 1) * 100
-                res['red_label_status'] = res.get('red_label', False)
-                return res
+                return data.get('response', {}).get('items', [])
         return None
     except Exception as e:
         logger.error(f"API Error: {e}")
@@ -55,29 +66,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text or len(text) > 100: return
 
     clean_id = text.strip().replace("@", "").split('/')[-1]
-    status_msg = await update.message.reply_text(f"📊 Анализирую метрики @{clean_id}...")
+    status_msg = await update.message.reply_text(f"🔬 Провожу глубокий аудит @{clean_id}...")
 
-    raw_data = get_tgstat_data(clean_id)
-    if not raw_data:
-        await status_msg.edit_text("❌ Ошибка API или канал не найден.")
+    posts = get_tgstat_data(clean_id)
+    if not posts:
+        await status_msg.edit_text("❌ Не удалось получить данные о постах.")
         return
 
-    # Используем исправленный ERR
-    subs = raw_data.get('participants_count', 0)
-    err = round(float(raw_data.get('err_fixed', 0)), 2)
+    # Математическая экспертиза
+    reasons, score = analyze_patterns(posts)
     
-    math_context = get_engagement_context(subs, err)
-
+    # Запрос к GPT для финальной упаковки
     analysis_prompt = (
-        "Ты — аналитик трафика. Твоя задача: найти ботов.\n\n"
-        f"КОНТЕКСТ: {math_context}\n"
-        f"RED LABEL (TGStat): {raw_data['red_label_status']}\n\n"
-        "ПРИНЦИПЫ:\n"
-        "1. Если RED LABEL = True -> НАКРУЧЕН.\n"
-        "2. Если статус 'ОРГАНИКА' или 'АВТОРСКИЙ' -> ЧИСТ. Высокие цифры — это успех контента.\n"
-        "3. Если статус 'НИЗКИЙ' у крупного канала — это норма, но у нового (до 100к) — признак ботов.\n"
-        "4. Сравнивай: @taknaglo (живой, высокий ERR), @shumim_media (накручен, стерильные цифры).\n\n"
-        "Напиши вердикт (ЧИСТ / НАКРУЧЕН) и коротко поясни."
+        f"Ты — эксперт-криминалист Telegram. Проанализируй результаты математического теста:\n\n"
+        f"Канал: @{clean_id}\n"
+        f"Выявленные паттерны: {', '.join(reasons)}\n"
+        f"Баллы подозрительности: {score}/10\n\n"
+        "ТВОЯ ЗАДАЧА:\n"
+        "1. Если баллы < 3 — канал ЧИСТ (приветствуй авторский контент).\n"
+        "2. Если баллы > 6 — канал НАКРУЧЕН (аргументируй 'стерильностью' или отсутствием пересылок).\n"
+        "3. Если 3-6 — ПОДОЗРИТЕЛЕН.\n\n"
+        "Напиши вердикт в стиле твоих предыдущих разборов: База, Ровность, Виральность, Итог."
     )
 
     try:
@@ -86,9 +95,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             messages=[{"role": "user", "content": analysis_prompt}],
             temperature=0.1
         )
-        await status_msg.edit_text(f"🏁 **Результат для @{clean_id}:** (ERR: {err}%)\n\n{completion.choices[0].message.content}")
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Ошибка нейросети: {e}")
+        await status_msg.edit_text(f"🏁 **Экспертиза @{clean_id}:**\n\n{completion.choices[0].message.content}")
+    except Exception:
+        await status_msg.edit_text("❌ Ошибка нейросети.")
 
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TOKEN).build()
