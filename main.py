@@ -1,8 +1,8 @@
 import os
 import logging
 import requests
-import statistics
 import json
+import statistics
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 from openai import OpenAI
@@ -17,94 +17,109 @@ TGSTAT_TOKEN = os.getenv("TGSTAT_TOKEN")
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 def run_deep_audit(posts, subs):
-    """Математика с защитой от пустых значений"""
-    if not posts:
-        return ["Нет данных по постам"], 0, 0
+    """Математический анализ с защитой авторских каналов"""
+    if not posts: return ["Недостаточно данных для анализа"], 0, 0
     
-    # Пытаемся достать просмотры и пересылки (учитываем разные имена ключей API)
-    reaches = []
-    forwards = []
-    for p in posts:
-        v = p.get('views_count') or p.get('views') or 0
-        f = p.get('forwards_count') or p.get('forwards') or 0
-        if not p.get('is_deleted'):
-            reaches.append(v)
-            forwards.append(f)
+    # Собираем просмотры и пересылки, фильтруя пустые значения
+    reaches = [p.get('views_count', 0) for p in posts if p.get('views_count') is not None]
+    forwards = [p.get('forwards_count', 0) for p in posts if p.get('forwards_count') is not None]
+    deleted_count = sum(1 for p in posts if p.get('is_deleted'))
     
-    if not reaches:
-        return ["Охваты не найдены в ответе API"], 0, 0
+    if not reaches or len(reaches) < 3:
+        return ["Слишком мало свежих постов для анализа"], 0, 0
 
     score = 0
     findings = []
+    
     avg_reach = statistics.mean(reaches)
     er = (avg_reach / subs * 100) if subs > 0 else 0
 
-    # Проверка на Хаос (CV)
+    # 1. АНАЛИЗ РОВНОСТИ (CV) — Ищем 'причесанные' цифры
     if len(reaches) >= 5:
         stdev_r = statistics.stdev(reaches)
         cv = (stdev_r / avg_reach * 100) if avg_reach > 0 else 0
-        if cv > 40:
-            score -= 4
-            findings.append(f"Живой хаос (CV {round(cv,1)}%)")
-        elif cv < 5:
-            score += 5
+        
+        if cv < 5: # Слишком ровно = боты
+            score += 4
             findings.append(f"Стерильная ровность (CV {round(cv,1)}%)")
+        elif cv > 35: # Хаотично = живой автор
+            score -= 3
+            findings.append(f"Естественный хаос охватов (CV {round(cv,1)}%)")
 
-    # Проверка виральности
+    # 2. АНАЛИЗ ВИРАЛЬНОСТИ
     total_fwd = sum(forwards)
-    if total_fwd > 5:
+    fwd_ratio = (total_fwd / sum(reaches) * 100) if sum(reaches) > 0 else 0
+    
+    if fwd_ratio > 0.5: # Если хотя бы 1 из 200 человек репостнул — это жизнь
+        score -= 3
+        findings.append(f"Хорошая виральность (репосты: {total_fwd})")
+    elif total_fwd == 0 and avg_reach > 1000:
+        score += 2
+        findings.append("Просмотры есть, а пересылок ноль")
+
+    # 3. АНАЛИЗ УДАЛЕНИЙ
+    if deleted_count > 4:
+        score += 2
+        findings.append(f"Много удаленных постов ({deleted_count})")
+
+    # 4. КОРРЕКЦИЯ ПО РАЗМЕРУ
+    if subs < 50000 and er > 20: # Маленький авторский канал с высоким вовлечением
         score -= 2
-        findings.append(f"Есть репосты ({total_fwd})")
+        findings.append("Высокая лояльность аудитории")
 
     return findings, score, er
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    if not text: return
+    if not text or len(text) > 100: return
     
     clean_id = text.strip().replace("@", "").split('/')[-1]
-    status_msg = await update.message.reply_text(f"📡 Запрос к TGStat для @{clean_id}...")
+    status_msg = await update.message.reply_text(f"🔍 Анализирую @{clean_id}...")
 
     try:
-        # 1. Получаем инфо о канале
+        # Получаем данные о канале
         info_url = f"https://api.tgstat.ru/channels/stat?token={TGSTAT_TOKEN}&channelId={clean_id}"
-        info_data = requests.get(info_url).json()
-        logger.info(f"INFO RESPONSE: {info_data}") # Лог в Railway
-
-        if info_data.get('status') != 'ok':
-            await status_msg.edit_text(f"❌ Ошибка TGStat: {info_data.get('error', 'Канал не найден')}")
+        info_res = requests.get(info_url).json()
+        
+        if info_res.get('status') != 'ok':
+            await status_msg.edit_text("❌ Канал не найден в базе TGStat.")
             return
 
-        res_info = info_data.get('response', {})
-        subs = res_info.get('participants_count', 0)
-
-        # 2. Получаем посты
-        posts_url = f"https://api.tgstat.ru/posts/list?token={TGSTAT_TOKEN}&channelId={clean_id}&limit=20"
-        posts_data = requests.get(posts_url).json()
-        logger.info(f"POSTS RESPONSE: {str(posts_data)[:500]}...") # Лог начала ответа
-
-        posts = posts_data.get('response', {}).get('items', [])
+        ch_data = info_res.get('response', {})
+        subs = ch_data.get('participants_count', 0)
+        red_label = ch_data.get('red_label', False)
         
+        # Получаем посты
+        posts_url = f"https://api.tgstat.ru/posts/list?token={TGSTAT_TOKEN}&channelId={clean_id}&limit=20"
+        posts_res = requests.get(posts_url).json()
+        posts = posts_res.get('response', {}).get('items', [])
+
         findings, score, er = run_deep_audit(posts, subs)
 
+        # Если есть Red Label от самого TGStat — это авто-бан
+        if red_label:
+            score = 10
+            findings.append("МЕТКА TGSTAT: КАНАЛ В ЧЕРНОМ СПИСКЕ")
+
         prompt = (
-            f"Ты — антифрод-эксперт. Канал @{clean_id}.\n"
-            f"Метрики: сабы {subs}, ERR {round(er,1)}%.\n"
-            f"Факты: {', '.join(findings)}. Балл фрода: {score}/10.\n"
-            "Напиши коротко: Чист или Накручен, и почему."
+            f"Ты — антифрод-эксперт. Вынеси вердикт каналу @{clean_id}.\n"
+            f"Данные: сабы={subs}, средний ER={round(er,1)}%.\n"
+            f"Результаты теста: {'; '.join(findings)}.\n"
+            f"Балл подозрительности: {score}/10.\n\n"
+            "Твои эталоны: @taknaglo (чист, много пересылок, хаос), @shumim_media (накручен, стерилен).\n"
+            "Напиши: База, Ровность, Виральность и финальный Итог."
         )
 
-        completion = client.chat.completions.create(
+        res = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.2
+            temperature=0.1
         )
-        
-        await status_msg.edit_text(f"🏁 **@{clean_id}**\n\n{completion.choices[0].message.content}")
+        await status_msg.edit_text(f"🏁 **Экспертиза @{clean_id}:**\n\n{res.choices[0].message.content}")
 
     except Exception as e:
-        logger.error(f"CRITICAL ERROR: {e}")
-        await status_msg.edit_text(f"📛 Ошибка: {str(e)}")
+        logger.error(f"Ошибка: {e}")
+        await status_msg.edit_text(f"❌ Произошла ошибка при анализе.")
 
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TOKEN).build()
