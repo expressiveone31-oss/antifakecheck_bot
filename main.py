@@ -6,7 +6,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 from openai import OpenAI
 
-# Настройка логирования — теперь мы будем видеть ВСЁ в логах Railway
+# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -14,89 +14,65 @@ TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TGSTAT_TOKEN = os.getenv("TGSTAT_TOKEN")
 
-if not OPENAI_API_KEY:
-    logger.error("КРИТИЧЕСКАЯ ОШИБКА: OPENAI_API_KEY не найден!")
-    client = None
-else:
-    client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 def get_tgstat_data(channel_id):
     url = "https://api.tgstat.ru/channels/stat"
-    params = {
-        "token": TGSTAT_TOKEN,
-        "channelId": channel_id
-    }
-    
+    params = {"token": TGSTAT_TOKEN, "channelId": channel_id}
     try:
         response = requests.get(url, params=params, timeout=15)
         if response.status_code == 200:
             data = response.json()
             if data.get("status") == "ok":
-                # ВАЖНО: Печатаем сырые данные в логи для ручной калибровки
-                logger.info(f"RAW DATA FOR {channel_id}: {json.dumps(data.get('response'), ensure_ascii=False)}")
+                logger.info(f"RAW DATA: {json.dumps(data.get('response'), ensure_ascii=False)}")
                 return data.get("response")
-            else:
-                logger.error(f"TGStat API Error: {data.get('error_query')}")
-                return f"Error_{data.get('error_query')}"
-        return f"HTTP_Error_{response.status_code}"
+        return None
     except Exception as e:
-        logger.error(f"Request failed: {e}")
+        logger.error(f"TGStat Error: {e}")
         return None
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    if not text or len(text) > 150: return
+    if not text or len(text) > 100: return
 
-    clean_id = text.strip()
-    status_msg = await update.message.reply_text(f"🧪 Калибровка: Анализирую {clean_id}...")
+    clean_id = text.strip().replace("@", "")
+    status_msg = await update.message.reply_text(f"🔍 Проверяю {clean_id}...")
 
     raw_data = get_tgstat_data(clean_id)
 
-    if str(raw_data).startswith("Error_") or str(raw_data).startswith("HTTP_"):
-        await status_msg.edit_text(f"❌ Ошибка TGStat: {raw_data}")
-        return
-    elif not raw_data:
-        await status_msg.edit_text("❓ Канал не найден или недоступен на Free-тарифе.")
+    if not raw_data:
+        await status_msg.edit_text("❌ Ошибка получения данных. Проверь лимиты тарифа S.")
         return
 
-    if client:
-        try:
-            # Улучшенный промпт с новыми весами
-            analysis_prompt = (
-                "Ты — элитный аналитик по борьбе с фейками и ботами в Telegram. "
-                "Твоя задача: отличить реальную популярность от накрутки.\n\n"
-                "ЭТАЛОННЫЕ ВЕСА ДЛЯ КАЛИБРОВКИ:\n"
-                "1. Масштаб: Для каналов > 100k сабов ERR 2-5% — это НОРМАЛЬНО. Не называй это накруткой.\n"
-                "2. Цитируемость (CI): Высокий CI у крупных каналов — это признак СМИ, а не ботов. "
-                "Подозрительно только если CI > 5000, а средний охват поста меньше 500.\n"
-                "3. Вовлеченность: ERR ниже 1% — критический сигнал накрутки при любом масштабе.\n"
-                "4. Охват: Если охват поста < 2% от аудитории — это 'мертвые души' или боты.\n\n"
-                analysis_prompt = (
-                "Ты — объективный аналитик Telegram. Твоя цель: отделить живой контент от ботов.\n\n"
-                "ПРАВИЛА ОЦЕНКИ (Шкала для каналов 10к-100к):\n"
-                "1. ОХВАТ: Если средний охват поста выше 15-20% от сабов — это ПРИЗНАК КАЧЕСТВА. Чем выше, тем лучше! "
-                "Вердикт 'Подозрительно' ставим ТОЛЬКО если охват ниже 3%.\n"
-                "2. ERR: Показатель 4-10% для канала 20к+ — это ОТЛИЧНЫЙ результат. Не смей называть это накруткой.\n"
-                "3. ЦИТИРУЕМОСТЬ (CI): CI выше 100 для малых каналов — это круто (виральность). "
-                "Блокируй канал только если CI аномально высокий (>5000), а охват при этом мизерный.\n"
-                "4. ПРИОРИТЕТ: Если ты видишь охват > 30%, канал априори считается ЖИВЫМ, даже если другие цифры прыгают.\n\n"
-                f"ДАННЫЕ: {json.dumps(raw_data, ensure_ascii=False)}\n\n"
-                "Напиши честный вердикт. Если канал живой как @taknaglo — так и пиши: ЧИСТ."
-            )
-            
-            completion = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": analysis_prompt}],
-                temperature=0.1 # Уменьшаем креативность для точности цифр
-            )
-            await status_msg.edit_text(f"✅ **Результат калибровки для {clean_id}:**\n\n{completion.choices[0].message.content}")
-        except Exception as e:
-            await status_msg.edit_text(f"❌ Ошибка нейросети: {e}")
-    else:
-        await status_msg.edit_text(f"📊 Raw Data получены (см. логи Railway)")
+    # НОВАЯ ЛОГИКА ПРОМПТА: Запрет на паранойю
+    analysis_prompt = (
+        "Ты — опытный медиа-аналитик. Твоя цель: найти РЕАЛЬНО ЖИВЫЕ каналы.\n\n"
+        "ЖЕСТКИЕ ПРАВИЛА АНАЛИЗА:\n"
+        "1. ВЫСОКИЙ ОХВАТ — ЭТО КРУТО: Если охват поста > 15%, это признак лояльной аудитории. "
+        "Если охват > 30% (как у @taknaglo или @supervhs), это ЭТАЛОН качества. "
+        "НИКОГДА не называй высокий охват признаком накрутки или ботов.\n"
+        "2. ERR: Для каналов до 100к сабов ERR 3-10% — это абсолютная норма. "
+        "Признак ботов — это когда ERR КРИТИЧЕСКИ НИЗКИЙ (меньше 1%).\n"
+        "3. ЦИТИРУЕМОСТЬ: Высокий CI при хорошем охвате — это виральность и успех контента.\n"
+        "4. ВЕРДИКТ: Если ты видишь охват > 20% и ERR > 2%, твой вердикт всегда 'ЧИСТ'.\n\n"
+        f"ДАННЫЕ КАНАЛА: {json.dumps(raw_data, ensure_ascii=False)}\n\n"
+        "Напиши вердикт (Чист / Подозрителен / Накручен) и кратко обоснуй цифрами, "
+        "соблюдая позитивный подход к высокой активности."
+    )
+
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "system", "content": "Ты — объективный аналитик."},
+                      {"role": "user", "content": analysis_prompt}],
+            temperature=0.1
+        )
+        await status_msg.edit_text(f"📊 **Анализ @{clean_id}:**\n\n{completion.choices[0].message.content}")
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Ошибка нейросети: {e}")
 
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    print("Бот запущен (версия: Калибровка)...")
+    print("Бот запущен...")
     app.run_polling()
