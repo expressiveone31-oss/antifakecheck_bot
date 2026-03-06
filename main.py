@@ -6,7 +6,6 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 from openai import OpenAI
 
-# Настройка логирования для Railway
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -16,8 +15,24 @@ TGSTAT_TOKEN = os.getenv("TGSTAT_TOKEN")
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
+def get_engagement_context(subs, err):
+    """Математическая матрица адекватности ERR"""
+    if subs < 10000:
+        expect = "20-60%"
+        status = "АВТОРСКИЙ/МИКРО" if err > 20 else "НИЗКИЙ"
+    elif 10000 <= subs < 100000:
+        expect = "10-30%"
+        status = "ОРГАНИКА/СРЕДНИЙ" if err > 10 else "ПОДОЗРИТЕЛЬНО НИЗКИЙ"
+    elif 100000 <= subs < 500000:
+        expect = "5-15%"
+        status = "КРУПНЫЙ МЕДИА" if err > 5 else "ВЯЛЫЙ"
+    else:
+        expect = "2-8%"
+        status = "ГИГАНТ" if err > 2 else "НИЗКИЙ"
+    
+    return f"Размер: {subs} сабов. Ожидаемый ERR: {expect}. Текущий ERR: {err}%. Статус: {status}."
+
 def get_tgstat_data(channel_id):
-    """Получение данных из TGStat API (Метод channels/stat)"""
     url = "https://api.tgstat.ru/channels/stat"
     params = {"token": TGSTAT_TOKEN, "channelId": channel_id}
     try:
@@ -26,73 +41,55 @@ def get_tgstat_data(channel_id):
             data = response.json()
             if data.get("status") == "ok":
                 res = data.get('response')
-                # Логируем важные для нас зацепки: охват, ERR и цитируемость
-                logger.info(f"АНАЛИЗ {channel_id}: сабы={res.get('participants_count')}, ERR={res.get('err')}, CI={res.get('ci_index')}")
+                res['red_label_status'] = res.get('red_label', False)
                 return res
         return None
     except Exception as e:
-        logger.error(f"Ошибка TGStat API: {e}")
+        logger.error(f"API Error: {e}")
         return None
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if not text or len(text) > 100: return
 
-    # Очистка юзернейма
     clean_id = text.strip().replace("@", "").split('/')[-1]
-    status_msg = await update.message.reply_text(f"🕵️‍♂️ Провожу экспертизу @{clean_id}...")
+    status_msg = await update.message.reply_text(f"📊 Калибрую матрицу для @{clean_id}...")
 
     raw_data = get_tgstat_data(clean_id)
-
     if not raw_data:
-        await status_msg.edit_text("❌ Данные не получены. Проверь лимиты тарифа S или корректность юзернейма.")
+        await status_msg.edit_text("❌ Ошибка данных.")
         return
 
-    # ФИНАЛЬНЫЙ СЛЕДСТВЕННЫЙ ПРОМПТ
+    # Получаем математический контекст
+    subs = raw_data.get('participants_count', 0)
+    err = raw_data.get('err', 0)
+    math_context = get_engagement_context(subs, err)
+
     analysis_prompt = (
-        "Ты — ведущий эксперт по выявлению кибер-фрода в Telegram. Твоя задача: "
-        "распознать профессиональную накрутку, которая имитирует живую активность.\n\n"
-        
-        "1. ЧЕРНЫЙ СПИСОК ПАТТЕРНОВ (Кейсы @TRND_X, @trendswhat, @shumim_media):\n"
-        "- Эти каналы используют 'стерильную' накрутку. Если ты видишь ERR в районе 5-10% "
-        "и охват 7-15%, который держится подозрительно ровно — это ПРИЗНАК БОТОВ.\n"
-        "- Особое внимание на Индекс цитируемости (CI): если он высокий, но репосты идут "
-        "из пустых или однотипных каналов-мусорщиков — это накрутка рейтинга для продажи рекламы.\n\n"
-        
-        "2. БЕЛЫЙ СПИСОК ПАТТЕРНОВ (Кейс @taknaglo):\n"
-        "- Это живой авторский контент. Здесь охват может быть аномально высоким (30-70%), "
-        "а ERR — скачущим. Для маленьких авторских каналов 'слишком много' просмотров — "
-        "это ПРИЗНАК ВИРАЛЬНОСТИ, а не ботов. Живые люди активно репостят такой контент.\n\n"
-        
-        "3. ТЕСТ НА 'ЖИВОЕ ДЫХАНИЕ':\n"
-        "- У накрученных каналов (как @shumim_media) соотношение охвата к подписчикам "
-        "всегда выглядит математически выверенным и слишком 'причесанным'.\n"
-        "- У живых каналов всегда есть хаос в цифрах: один пост взлетает, другой нет.\n\n"
-        
-        f"ДАННЫЕ ДЛЯ ЭКСПЕРТИЗЫ: {json.dumps(raw_data, ensure_ascii=False)}\n\n"
-        "Вынеси вердикт: ЧИСТ (как @taknaglo) / НАКРУЧЕН (как сетки выше) / ПОДОЗРИТЕЛЕН. "
-        "Обоснуй, почему цифры выглядят либо как органический хаос, либо как 'стерильный' налив."
+        "Ты — аудитор-криминалист. Используй предоставленную математическую матрицу для вынесения вердикта.\n\n"
+        f"МАТЕМАТИЧЕСКИЙ КОНТЕКСТ: {math_context}\n"
+        f"RED LABEL ОТ TGSTAT: {raw_data['red_label_status']}\n\n"
+        "ПРАВИЛА:\n"
+        "1. Если RED LABEL = True -> ВЕРДИКТ: НАКРУЧЕН (без обсуждений).\n"
+        "2. Если статус 'ОРГАНИКА' или 'АВТОРСКИЙ' -> ВЕРДИКТ: ЧИСТ. Высокий ERR здесь — признак жизни, а не ботов.\n"
+        "3. Если статус 'НИЗКИЙ' или 'ПОДОЗРИТЕЛЬНО НИЗКИЙ' у нового канала -> ВЕРДИКТ: ПОДОЗРИТЕЛЬНЫЙ (вероятна накрутка ботами для имитации массы).\n"
+        "4. Сравнивай с эталонами: @taknaglo (чист, высокая органика), @shumim_media (накручен, стерильные цифры).\n\n"
+        f"СЫРЫЕ ДАННЫЕ ДЛЯ СПРАВКИ: {json.dumps(raw_data, ensure_ascii=False)}\n\n"
+        "Напиши финальный вердикт и коротко поясни логику через охват и пересылки."
     )
 
     try:
         completion = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Ты — беспристрастный эксперт-аналитик."},
-                {"role": "user", "content": analysis_prompt}
-            ],
+            messages=[{"role": "system", "content": "Ты — объективный аналитик-математик."},
+                      {"role": "user", "content": analysis_prompt}],
             temperature=0.1
         )
-        await status_msg.edit_text(f"📊 **Вердикт экспертизы для @{clean_id}:**\n\n{completion.choices[0].message.content}")
+        await status_msg.edit_text(f"🏁 **Вердикт для @{clean_id}:**\n\n{completion.choices[0].message.content}")
     except Exception as e:
-        logger.error(f"OpenAI Error: {e}")
-        await status_msg.edit_text("❌ Ошибка при анализе нейросетью.")
+        await status_msg.edit_text(f"❌ Ошибка нейросети: {e}")
 
 if __name__ == '__main__':
-    if not TOKEN:
-        print("ОШИБКА: BOT_TOKEN не установлен!")
-    else:
-        app = ApplicationBuilder().token(TOKEN).build()
-        app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-        print("Анти-фрод бот запущен...")
-        app.run_polling()
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    app.run_polling()
