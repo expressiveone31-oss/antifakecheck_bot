@@ -16,19 +16,18 @@ TGSTAT_TOKEN = os.getenv("TGSTAT_TOKEN")
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 def get_engagement_context(subs, err):
-    """Математическая матрица адекватности ERR"""
+    """Математическая матрица адекватности ERR с защитой от нулевых значений"""
+    if not err or err == 0:
+        return f"Размер: {subs} сабов. Данные по ERR отсутствуют или равны 0. Требуется ручной анализ охватов."
+    
     if subs < 10000:
-        expect = "20-60%"
-        status = "АВТОРСКИЙ/МИКРО" if err > 20 else "НИЗКИЙ"
+        expect, status = "20-60%", ("АВТОРСКИЙ" if err > 20 else "НИЗКИЙ")
     elif 10000 <= subs < 100000:
-        expect = "10-30%"
-        status = "ОРГАНИКА/СРЕДНИЙ" if err > 10 else "ПОДОЗРИТЕЛЬНО НИЗКИЙ"
+        expect, status = "10-30%", ("ОРГАНИКА" if err > 8 else "ПОДОЗРИТЕЛЬНО НИЗКИЙ")
     elif 100000 <= subs < 500000:
-        expect = "5-15%"
-        status = "КРУПНЫЙ МЕДИА" if err > 5 else "ВЯЛЫЙ"
+        expect, status = "5-15%", ("МЕДИА" if err > 4 else "ВЯЛЫЙ")
     else:
-        expect = "2-8%"
-        status = "ГИГАНТ" if err > 2 else "НИЗКИЙ"
+        expect, status = "2-8%", ("ГИГАНТ" if err > 1.5 else "НИЗКИЙ")
     
     return f"Размер: {subs} сабов. Ожидаемый ERR: {expect}. Текущий ERR: {err}%. Статус: {status}."
 
@@ -40,7 +39,10 @@ def get_tgstat_data(channel_id):
         if response.status_code == 200:
             data = response.json()
             if data.get("status") == "ok":
-                res = data.get('response')
+                res = data.get('response', {})
+                # НОРМАЛИЗАЦИЯ: TGStat может отдавать ERR в разных полях
+                # Пробуем вытащить хоть какое-то значение вовлеченности
+                res['err_fixed'] = res.get('err') or res.get('err_percent') or res.get('avg_post_reach', 0) / res.get('participants_count', 1) * 100
                 res['red_label_status'] = res.get('red_label', False)
                 return res
         return None
@@ -53,39 +55,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text or len(text) > 100: return
 
     clean_id = text.strip().replace("@", "").split('/')[-1]
-    status_msg = await update.message.reply_text(f"📊 Калибрую матрицу для @{clean_id}...")
+    status_msg = await update.message.reply_text(f"📊 Анализирую метрики @{clean_id}...")
 
     raw_data = get_tgstat_data(clean_id)
     if not raw_data:
-        await status_msg.edit_text("❌ Ошибка данных.")
+        await status_msg.edit_text("❌ Ошибка API или канал не найден.")
         return
 
-    # Получаем математический контекст
+    # Используем исправленный ERR
     subs = raw_data.get('participants_count', 0)
-    err = raw_data.get('err', 0)
+    err = round(float(raw_data.get('err_fixed', 0)), 2)
+    
     math_context = get_engagement_context(subs, err)
 
     analysis_prompt = (
-        "Ты — аудитор-криминалист. Используй предоставленную математическую матрицу для вынесения вердикта.\n\n"
-        f"МАТЕМАТИЧЕСКИЙ КОНТЕКСТ: {math_context}\n"
-        f"RED LABEL ОТ TGSTAT: {raw_data['red_label_status']}\n\n"
-        "ПРАВИЛА:\n"
-        "1. Если RED LABEL = True -> ВЕРДИКТ: НАКРУЧЕН (без обсуждений).\n"
-        "2. Если статус 'ОРГАНИКА' или 'АВТОРСКИЙ' -> ВЕРДИКТ: ЧИСТ. Высокий ERR здесь — признак жизни, а не ботов.\n"
-        "3. Если статус 'НИЗКИЙ' или 'ПОДОЗРИТЕЛЬНО НИЗКИЙ' у нового канала -> ВЕРДИКТ: ПОДОЗРИТЕЛЬНЫЙ (вероятна накрутка ботами для имитации массы).\n"
-        "4. Сравнивай с эталонами: @taknaglo (чист, высокая органика), @shumim_media (накручен, стерильные цифры).\n\n"
-        f"СЫРЫЕ ДАННЫЕ ДЛЯ СПРАВКИ: {json.dumps(raw_data, ensure_ascii=False)}\n\n"
-        "Напиши финальный вердикт и коротко поясни логику через охват и пересылки."
+        "Ты — аналитик трафика. Твоя задача: найти ботов.\n\n"
+        f"КОНТЕКСТ: {math_context}\n"
+        f"RED LABEL (TGStat): {raw_data['red_label_status']}\n\n"
+        "ПРИНЦИПЫ:\n"
+        "1. Если RED LABEL = True -> НАКРУЧЕН.\n"
+        "2. Если статус 'ОРГАНИКА' или 'АВТОРСКИЙ' -> ЧИСТ. Высокие цифры — это успех контента.\n"
+        "3. Если статус 'НИЗКИЙ' у крупного канала — это норма, но у нового (до 100к) — признак ботов.\n"
+        "4. Сравнивай: @taknaglo (живой, высокий ERR), @shumim_media (накручен, стерильные цифры).\n\n"
+        "Напиши вердикт (ЧИСТ / НАКРУЧЕН) и коротко поясни."
     )
 
     try:
         completion = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "system", "content": "Ты — объективный аналитик-математик."},
-                      {"role": "user", "content": analysis_prompt}],
+            messages=[{"role": "user", "content": analysis_prompt}],
             temperature=0.1
         )
-        await status_msg.edit_text(f"🏁 **Вердикт для @{clean_id}:**\n\n{completion.choices[0].message.content}")
+        await status_msg.edit_text(f"🏁 **Результат для @{clean_id}:** (ERR: {err}%)\n\n{completion.choices[0].message.content}")
     except Exception as e:
         await status_msg.edit_text(f"❌ Ошибка нейросети: {e}")
 
