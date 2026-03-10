@@ -51,7 +51,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if response.status_code != 200:
             # Декодируем Unicode-ответ, чтобы ты видела текст ошибки
             error_raw = response.content.decode('unicode-escape')
-           await status_msg.edit_text(f"❌ Ошибка {response.status_code}\n Ответ: {error_raw}")
+            await status_msg.edit_text(f"❌ Ошибка {response.status_code}\n Ответ: {error_raw}")
 
         data = response.json()
         # Извлекаем данные (у Telemetr они обычно в response или data)
