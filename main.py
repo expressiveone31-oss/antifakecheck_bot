@@ -35,23 +35,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
    # Формируем данные как форму (Form-Data)
-    # Это часто решает проблему, когда API "не видит" параметры в URL или JSON
-    payload = {'id': clean_id}
+ # Пробуем все варианты ключей, которые может ждать API
+    payload = {
+        'id': clean_id,
+        'username': clean_id,
+        'link': f"t.me/{clean_id}"
+    }
     
     try:
-        # Пробуем отправить как data= (это и есть form-data)
+        # Отправляем как параметры строки (самый вероятный вариант для GET)
         response = requests.get(url, headers=headers, params=payload, timeout=15)
         
-        # Если всё еще 400, пробуем передать напрямую в data
-        if response.status_code == 400:
-            response = requests.get(url, headers=headers, data=payload, timeout=15)
-
         logger.info(f"Telemetr Status: {response.status_code}")
 
         if response.status_code != 200:
-            # Декодируем Unicode-ответ, чтобы ты видела текст ошибки
+            # Декодируем Unicode-ответ для ясности
             error_raw = response.content.decode('unicode-escape')
             await status_msg.edit_text(f"❌ Ошибка {response.status_code}\n Ответ: {error_raw}")
+            return
 
         data = response.json()
         # Извлекаем данные (у Telemetr они обычно в response или data)
