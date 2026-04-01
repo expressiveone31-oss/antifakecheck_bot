@@ -14,51 +14,45 @@ TOKEN = os.getenv("BOT_TOKEN")
 TELEMETR_TOKEN = os.getenv("TELEMETR_TOKEN")
 
 async def check_telemetr(channel_id):
-    """Функция для проверки одного канала через JSON-запрос"""
-    url = "https://api.telemetr.me/channels/stat" # Пробуем базовый адрес
+    # Используем адрес, который ты обсуждала с поддержкой
+    url = f"https://api.telemetr.me/channels/get"
     headers = {
         "Authorization": f"Bearer {TELEMETR_TOKEN}",
-        "Accept": "application/json",
-        "Content-Type": "application/json"
+        "Accept": "application/json"
     }
-    
-    # Отправляем ID во всех возможных полях внутри JSON
-    payload = {
-        "id": channel_id,
-        "username": channel_id
-    }
+    # Передаем параметр именно как channelId (как просит их документация)
+    params = {"channelId": channel_id}
     
     try:
-        # ВНИМАНИЕ: используем json=payload вместо params=payload
-        response = requests.get(url, headers=headers, json=payload, timeout=10)
+        response = requests.get(url, headers=headers, params=params, timeout=10)
         
         if response.status_code == 200:
             data = response.json()
+            # Проверяем структуру ответа (у Telemetr она вложенная)
             info = data.get('response', {})
             
-            # Проверяем метки накрутки
+            # Твой новый функционал: ищем флаг накрутки
             is_fake = info.get('is_fake', False)
             restrictions = info.get('restrictions', [])
             
             if is_fake or restrictions:
-                res_text = ", ".join(restrictions) if restrictions else "Метка накрутки"
-                return f"🚩 @{channel_id}: **НАКРУТКА** ({res_text})"
+                reason = ", ".join(restrictions) if restrictions else "Метка накрутки"
+                return f"🚩 @{channel_id}: **ФРОД** ({reason})"
             else:
                 subs = info.get('participants_count', 0)
-                return f"✅ @{channel_id}: Чисто ({subs} сабов)"
+                return f"✅ @{channel_id}: Чисто (сабов: {subs})"
         
-        # Если всё еще 400, попробуем старый добрый метод в строке URL (fallback)
-        elif response.status_code == 400:
-            fallback_url = f"https://api.telemetr.me/channels/stat?id={channel_id}"
-            response = requests.get(fallback_url, headers=headers, timeout=10)
-            if response.status_code == 200:
-                # ... повторить логику обработки (для краткости пропустим)
-                return f"✅ @{channel_id}: Проверен через URL"
-
-        return f"⚠️ @{channel_id}: Ошибка {response.status_code}"
-        
+        elif response.status_code == 403:
+            return f"🚫 @{channel_id}: Ошибка 403 (Нет прав API)"
+        else:
+            # Декодируем сообщение об ошибке от самого Телеметра
+            try:
+                err_msg = response.json().get('response', {}).get('message', 'Неизвестная ошибка')
+            except:
+                err_msg = response.text
+            return f"⚠️ @{channel_id}: {err_msg} (Код {response.status_code})"
+            
     except Exception as e:
-        logger.error(f"Error checking {channel_id}: {e}")
         return f"❌ @{channel_id}: Ошибка соединения"
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
