@@ -10,12 +10,17 @@ from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, Comma
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Токены (подтягиваются из переменных Railway)
+# Токены из Railway
 TOKEN = os.getenv("BOT_TOKEN")
 TELEMETR_TOKEN = os.getenv("TELEMETR_TOKEN")
 
+def escape_markdown(text):
+    """Экранирует спецсимволы для Telegram MarkdownV2"""
+    parse_chars = r'_*[]()~`>#+-=|{}.!'
+    return re.sub(f'([{re.escape(parse_chars)}])', r'\\\1', text)
+
 async def check_telemetr(channel_id):
-    """Проверка одного канала на флаги накрутки"""
+    """Проверка одного канала через API Telemetr"""
     url = "https://api.telemetr.me/channels/get"
     headers = {
         "Authorization": f"Bearer {TELEMETR_TOKEN}",
@@ -30,79 +35,67 @@ async def check_telemetr(channel_id):
             data = response.json()
             info = data.get('response', {})
             
-            # Проверяем метки накрутки (fake) и ограничения (restrictions)
+            # Проверяем метки накрутки
             is_fake = info.get('is_fake', False)
             restrictions = info.get('restrictions', [])
             
             if is_fake or restrictions:
                 reason = ", ".join(restrictions) if restrictions else "Метка накрутки"
-                return f"🚩 @{channel_id}: **ФРОД** ({reason})"
+                return f"🚩 @{channel_id}: *ФРОД* ({reason})"
             else:
                 subs = info.get('participants_count', 0)
                 return f"✅ @{channel_id}: Чисто (сабов: {subs})"
         
         elif response.status_code == 403:
-            return f"🚫 @{channel_id}: Ошибка 403 (Нет прав API/Лимиты)"
+            return f"🚫 @{channel_id}: Ошибка 403 (Нет прав API)"
         else:
-            # Пытаемся достать текст ошибки из ответа API
-            try:
-                err_msg = response.json().get('response', {}).get('message', 'Ошибка данных')
-            except:
-                err_msg = f"Код {response.status_code}"
-            return f"⚠️ @{channel_id}: {err_msg}"
+            return f"⚠️ @{channel_id}: Ошибка {response.status_code}"
             
     except Exception as e:
-        logger.error(f"Ошибка при проверке {channel_id}: {e}")
+        logger.error(f"Ошибка API: {e}")
         return f"❌ @{channel_id}: Ошибка соединения"
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Приветствие при команде /start"""
+    """Приветствие"""
     await update.message.reply_text(
-        "👋 Привет! Я готов проверять списки каналов на накрутку.\n\n"
-        "Просто пришли мне юзернеймы через @ или ссылки на каналы (можно пачкой)."
+        "👋 Привет! Пришли мне список каналов (через @ или ссылками), и я проверю их на накрутку через Telemetr."
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка входящих сообщений со списками каналов"""
+    """Обработка пачки каналов"""
     text = update.message.text
     if not text: return
 
-    # Извлекаем все юзернеймы из текста (минимум 5 символов)
+    # Вытаскиваем юзернеймы
     raw_channels = re.findall(r'(?:@|t\.me\/|https:\/\/t\.me\/)([a-zA-Z0-9_]{5,})', text)
-    channels = list(dict.fromkeys(raw_channels)) # Убираем дубликаты, сохраняя порядок
+    channels = list(dict.fromkeys(raw_channels))
 
     if not channels:
-        await update.message.reply_text("В сообщении не найдено ссылок на каналы. Пришли список через @.")
+        await update.message.reply_text("Не нашел ссылок на каналы в сообщении.")
         return
 
     status_msg = await update.message.reply_text(f"🔎 Начинаю проверку {len(channels)} каналов...")
 
     results = []
-    for channel in channels:
+    for index, channel in enumerate(channels, 1):
         res = await check_telemetr(channel)
         results.append(res)
         
-        # Обновляем сообщение каждые 3 канала для наглядности
-        if len(results) % 3 == 0:
-            await status_msg.edit_text(f"⏳ Проверено {len(results)} из {len(channels)}...\n\n" + "\n".join(results))
+        # Обновляем прогресс каждые 3 канала (безопасно для Telegram)
+        if index % 3 == 0 or index == len(channels):
+            current_status = f"⏳ Проверено {index} из {len(channels)}...\n\n" + "\n".join(results)
+            # Экранируем текст перед отправкой, чтобы не упало на 3-м канале
+            try:
+                await status_msg.edit_text(escape_markdown(current_status), parse_mode='MarkdownV2')
+            except Exception as e:
+                logger.warning(f"Ошибка разметки: {e}")
+                await status_msg.edit_text(current_status) # Фолбэк на обычный текст
         
-        # Пауза, чтобы не злить Telegram и API
-        await asyncio.sleep(1.2)
-
-    # ФИНАЛЬНОЕ ОБНОВЛЕНИЕ: выводим весь список целиком
-    final_text = f"🏁 **Результаты проверки ({len(results)} из {len(channels)}):**\n\n" + "\n".join(results)
-    
-    # Защита от слишком длинных сообщений (лимит TG 4096 симв.)
-    if len(final_text) > 4000:
-        final_text = final_text[:3950] + "\n\n...список обрезан"
-
-    await status_msg.edit_text(final_text, parse_mode='Markdown')
+        await asyncio.sleep(1.5) # Пауза для обхода лимитов Telegram
 
 if __name__ == '__main__':
-    # Сборка приложения
     app = ApplicationBuilder().token(TOKEN).build()
     
-    # Обработчики
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     
