@@ -26,47 +26,39 @@ def get_clean_id(channel_input):
         return None
     return clean
 
-async def check_telemetr(channel_id):
-    url = "https://api.telemetr.me/channels/get"
-    headers = {"Authorization": f"Bearer {TELEMETR_TOKEN}", "Accept": "application/json"}
-    params = {"channelId": channel_id}
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        if response.status_code == 200:
-            info = response.json().get('response', {})
-            if info.get('is_fake') or info.get('restrictions'):
-                return "FRAUD", f"🚩 @{channel_id}: *ФРОД* (Telemetr)"
-            return "CLEAN", None
-        return "ERROR", f"⚠️ @{channel_id}: Ошибка Telemetr"
-    except:
-        return "ERROR", f"❌ @{channel_id}: Ошибка связи"
-
 async def check_tgstat(channel_id):
-    """Проверка через метод get для получения меток scam/red_label"""
-    # Используем метод get для полной информации
+    """Глубокая проверка меток накрутки в TGStat"""
     url = "https://api.tgstat.ru/channels/get"
-    params = {"token": TGSTAT_TOKEN, "channelId": channel_id}
+    clean_id = get_clean_id(channel_id)
+    params = {"token": TGSTAT_TOKEN, "channelId": clean_id}
     
     try:
         response = requests.get(url, params=params, timeout=15)
         if response.status_code == 200:
             data = response.json()
+            
+            # Если API вернул ошибку (например, канал забанен в базе)
             if data.get('status') == 'error':
-                return f"⚠️ @{channel_id}: TGStat ({data.get('error')})"
+                return f"🚩 @{clean_id}: *ФРОД* (TGStat: {data.get('error')})"
             
             ch_info = data.get('response', {})
-            # Проверяем все возможные признаки фрода в TGStat
-            if any([
-                ch_info.get('is_scam'), 
-                ch_info.get('red_label'), 
-                ch_info.get('is_fake')
-            ]):
-                return f"🚩 @{channel_id}: *ФРОД* (TGStat)"
             
-            return f"✅ @{channel_id}: Чисто (Проверен везде)"
-        return f"⚠️ @{channel_id}: Ошибка TGStat ({response.status_code})"
-    except:
-        return f"❌ @{channel_id}: Ошибка связи"
+            # Проверяем ВСЕ возможные маркеры проблем
+            # 0 — чисто, 1 — есть метка
+            is_scam = ch_info.get('is_scam', 0)
+            red_label = ch_info.get('red_label', 0)
+            is_fake = ch_info.get('is_fake', 0)
+            
+            # Ловим 'lovi_trand' и подобные
+            if is_scam == 1 or red_label == 1 or is_fake == 1:
+                return f"🚩 @{clean_id}: *ФРОД* (TGStat: метка накрутки)"
+            
+            return f"✅ @{clean_id}: Чисто (Проверен везде)"
+            
+        return f"⚠️ @{clean_id}: Ошибка TGStat ({response.status_code})"
+    except Exception as e:
+        logger.error(f"TGStat Error: {e}")
+        return f"❌ @{clean_id}: Ошибка связи"
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
