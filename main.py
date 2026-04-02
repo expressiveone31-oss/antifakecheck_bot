@@ -44,7 +44,7 @@ async def check_telemetr(channel_id):
                 return f"🚩 @{channel_id}: *ФРОД* ({reason})"
             else:
                 subs = info.get('participants_count', 0)
-                return f"✅ @{channel_id}: Чисто (сабов: {subs})"
+                return f"✅ @{channel_id}: Чисто (подписчиков: {subs})"
         
         elif response.status_code == 403:
             return f"🚫 @{channel_id}: Ошибка 403 (Нет прав API)"
