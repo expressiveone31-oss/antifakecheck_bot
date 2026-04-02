@@ -59,7 +59,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Приветствие"""
     await update.message.reply_text(
         "👋 Привет! Пришли мне список каналов, и я проверю их на накрутку через Telemetr.\n"
-        "Лишнее убрал, теперь только статус: чисто или фрод."
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
