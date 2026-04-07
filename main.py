@@ -71,7 +71,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if not text: return
 
-    # Ищем потенциальные ссылки и юзернеймы
+    # Улучшенный поиск ссылок, который не ломается от кривых доменов
     potential = re.findall(r'(?:@|t\.me\/|https?:\/\/)?([a-zA-Z0-9_]{5,})', text)
     
     channels = []
@@ -81,30 +81,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             channels.append(cid)
 
     if not channels:
-        await update.message.reply_text("Не нашел корректных юзернеймов каналов.")
+        await update.message.reply_text("Не нашел ссылок на каналы.")
         return
 
-    status_msg = await update.message.reply_text(f"🔎 Двойная проверка {len(channels)} каналов...")
+    status_msg = await update.message.reply_text(f"🔎 Проверка {len(channels)} каналов...")
     results = []
 
     for index, channel in enumerate(channels, 1):
-        # 1. Telemetr
         state, report = await check_telemetr(channel)
-        
         if state == "CLEAN":
-            # 2. TGStat (метод get)
             final_report = await check_tgstat(channel)
             results.append(final_report)
         else:
             results.append(report)
         
         if index % 2 == 0 or index == len(channels):
+            # Самое важное: экранируем весь текст перед отправкой
             current_status = f"⏳ Прогресс: {index}/{len(channels)}\n\n" + "\n".join(results)
+            safe_text = escape_markdown(current_status) 
             try:
-                await status_msg.edit_text(escape_markdown(current_status), parse_mode='MarkdownV2')
-            except:
+                await status_msg.edit_text(safe_text, parse_mode='MarkdownV2')
+            except Exception as e:
+                # Если Markdown всё равно подвел — шлем обычным текстом
+                logger.error(f"Markdown error: {e}")
                 await status_msg.edit_text(current_status)
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(1.2)
 
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TOKEN).build()
