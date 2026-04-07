@@ -6,11 +6,9 @@ import re
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Токены из Railway
 TOKEN = os.getenv("BOT_TOKEN")
 TELEMETR_TOKEN = os.getenv("TELEMETR_TOKEN")
 TGSTAT_TOKEN = os.getenv("TGSTAT_TOKEN")
@@ -20,56 +18,62 @@ def escape_markdown(text):
     return re.sub(f'([{re.escape(parse_chars)}])', r'\\\1', text)
 
 def get_clean_id(channel_input):
-    """Очистка юзернейма от ссылок и мусора"""
+    """Строгая очистка юзернейма"""
+    # Убираем все, что до последнего слеша и символ @
     clean = channel_input.split('/')[-1].replace('@', '').strip()
+    # Если после очистки осталось 'https' или пустота — это мусор
     if clean.lower() in ['https', 'http', 't.me', '']:
         return None
     return clean
 
-# 1. СНАЧАЛА ОБЪЯВЛЯЕМ check_telemetr
-async def check_telemetr(channel_id):
-    url = "https://api.telemetr.me/channels/get"
-    headers = {"Authorization": f"Bearer {TELEMETR_TOKEN}", "Accept": "application/json"}
-    params = {"channelId": channel_id}
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        if response.status_code == 200:
-            info = response.json().get('response', {})
-            if info.get('is_fake') or info.get('restrictions'):
-                return "FRAUD", f"🚩 @{channel_id}: *ФРОД* (Telemetr)"
-            return "CLEAN", None
-        return "ERROR", f"⚠️ @{channel_id}: Ошибка Telemetr"
-    except:
-        return "ERROR", f"❌ @{channel_id}: Ошибка связи"
-
-# 2. ЗАТЕМ check_tgstat
 async def check_tgstat(channel_id):
-    url = "https://api.tgstat.ru/channels/get"
-    params = {"token": TGSTAT_TOKEN, "channelId": channel_id}
+    """Проверка через метод stat + глубокий поиск скрытых меток"""
+    # Метод stat часто содержит больше 'живых' данных о нарушениях
+    url = "https://api.tgstat.ru/channels/stat"
+    clean_id = get_clean_id(channel_id)
+    params = {"token": TGSTAT_TOKEN, "channelId": clean_id}
+    
     try:
         response = requests.get(url, params=params, timeout=15)
         if response.status_code == 200:
             data = response.json()
+            
             if data.get('status') == 'error':
-                return f"⚠️ @{channel_id}: TGStat ({data.get('error')})"
+                # Если канал удален из базы за накрутку, TGStat вернет ошибку 'channel not found'
+                return f"🚩 @{clean_id}: *ФРОД* (TGStat: Удален или забанен)"
             
-            ch_info = data.get('response', {})
-            # Проверяем все возможные признаки накрутки (red_label точно ловит Лови Тренд)
-            if any([ch_info.get('is_scam'), ch_info.get('red_label'), ch_info.get('is_fake')]):
-                return f"🚩 @{channel_id}: *ФРОД* (TGStat)"
+            ch_data = data.get('response', {})
             
-            return f"✅ @{channel_id}: Чисто (Проверен везде)"
-        return f"⚠️ @{channel_id}: Ошибка TGStat ({response.status_code})"
-    except:
-        return f"❌ @{channel_id}: Ошибка связи"
+            # 1. Проверка явных флагов (теперь ловим и через метод stat)
+            # Иногда они приходят как строки "0"/"1", поэтому делаем int()
+            is_scam = int(ch_data.get('is_scam', 0))
+            red_label = int(ch_data.get('red_label', 0))
+            
+            if is_scam == 1 or red_label == 1:
+                return f"🚩 @{clean_id}: *ФРОД* (TGStat: Метка накрутки)"
+            
+            # 2. Проверка аномалий (ИЦ = 0 при большом охвате или скрытая статистика)
+            # Если у канала > 1000 сабов, но ИЦ (ci_index) равен 0 — это подозрительно
+            participants = ch_data.get('participants_count', 0)
+            ci_index = ch_data.get('ci_index', 0)
+            
+            if participants > 1000 and ci_index == 0:
+                return f"🚩 @{clean_id}: *ФРОД* (TGStat: Аномальный ИЦ)"
 
-# 3. ПОТОМ handle_message, которая их использует
+            return f"✅ @{clean_id}: Чисто (Проверен везде)"
+            
+        return f"⚠️ @{clean_id}: Ошибка TGStat ({response.status_code})"
+    except Exception as e:
+        logger.error(f"TGStat Error: {e}")
+        return f"❌ @{clean_id}: Ошибка связи"
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if not text: return
 
-    # Парсим юзернеймы
+    # Ищем потенциальные ссылки и юзернеймы
     potential = re.findall(r'(?:@|t\.me\/|https?:\/\/)?([a-zA-Z0-9_]{5,})', text)
+    
     channels = []
     for p in potential:
         cid = get_clean_id(p)
@@ -77,17 +81,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             channels.append(cid)
 
     if not channels:
-        await update.message.reply_text("Не нашел ссылок на каналы.")
+        await update.message.reply_text("Не нашел корректных юзернеймов каналов.")
         return
 
-    status_msg = await update.message.reply_text(f"🔎 Проверка {len(channels)} каналов...")
+    status_msg = await update.message.reply_text(f"🔎 Двойная проверка {len(channels)} каналов...")
     results = []
 
     for index, channel in enumerate(channels, 1):
-        # Теперь Python точно найдет эти функции
+        # 1. Telemetr
         state, report = await check_telemetr(channel)
         
         if state == "CLEAN":
+            # 2. TGStat (метод get)
             final_report = await check_tgstat(channel)
             results.append(final_report)
         else:
@@ -99,12 +104,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await status_msg.edit_text(escape_markdown(current_status), parse_mode='MarkdownV2')
             except:
                 await status_msg.edit_text(current_status)
-        await asyncio.sleep(1.2)
+        await asyncio.sleep(1.5)
 
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("Бот в строю! Жду список.")))
+    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("Бот готов! Присылай список.")))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    
-    # drop_pending_updates=True очистит очередь, чтобы бот не "тупил" после рестарта
     app.run_polling(drop_pending_updates=True)
