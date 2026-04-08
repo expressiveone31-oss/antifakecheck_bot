@@ -6,96 +6,75 @@ import re
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
-# Настройка логирования для Railway
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Загрузка токенов
 TOKEN = os.getenv("BOT_TOKEN")
 TELEMETR_TOKEN = os.getenv("TELEMETR_TOKEN")
 TGSTAT_TOKEN = os.getenv("TGSTAT_TOKEN")
 
-# Проверка токенов при старте (защита от краша)
-if not TOKEN:
-    print("ОШИБКА: BOT_TOKEN не найден в переменных окружения!")
-
-def get_clean_id(channel_input):
-    """Извлекает чистый юзернейм из ссылки или @тега"""
-    clean = channel_input.split('/')[-1].replace('@', '').strip()
-    return clean if clean else None
-
 async def check_telemetr(channel_id):
-    """Проверка через Telemetr"""
     url = "https://api.telemetr.me/channels/get"
     headers = {"Authorization": f"Bearer {TELEMETR_TOKEN}"}
     try:
         r = requests.get(url, headers=headers, params={"channelId": channel_id}, timeout=10)
         if r.status_code == 200:
             data = r.json().get('response', {})
-            # Проверяем явные метки фрода
             if data.get('is_fake') or data.get('restrictions'):
                 return "FRAUD", f"🚩 @{channel_id}: ФРОД (Telemetr)"
             return "CLEAN", None
-        return "ERROR", f"⚠️ @{channel_id}: Ошибка Telemetr"
-    except Exception as e:
-        return "ERROR", f"❌ @{channel_id}: Ошибка связи"
+        return "ERROR", f"⚠️ @{channel_id}: Ошибка API"
+    except:
+        return "ERROR", f"❌ @{channel_id}: Связь"
 
 async def check_tgstat(channel_id):
-    """Проверка через TGStat (Ловим red_label для Лови Тренд)"""
     url = "https://api.tgstat.ru/channels/get"
     try:
         r = requests.get(url, params={"token": TGSTAT_TOKEN, "channelId": channel_id}, timeout=10)
         if r.status_code == 200:
             res = r.json().get('response', {})
-            # Прямая проверка красной метки
             if res.get('red_label') == 1 or res.get('is_scam') == 1:
-                return f"🚩 @{channel_id}: ФРОД (TGStat: метка накрутки)"
+                return f"🚩 @{channel_id}: ФРОД (TGStat)"
             return f"✅ @{channel_id}: Чисто"
-        return f"⚠️ @{channel_id}: Ошибка TGStat"
-    except Exception as e:
-        return f"❌ @{channel_id}: Ошибка связи"
+        return f"⚠️ @{channel_id}: Ошибка API"
+    except:
+        return f"❌ @{channel_id}: Связь"
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text: return
+async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Лог для проверки: видит ли бот сообщение вообще
+    logger.info(f"Получено сообщение: {update.message.text}")
     
-    # Поиск юзернеймов в тексте
+    if not update.message.text: return
+    
+    # Ищем юзернеймы
     potential = re.findall(r'(?:@|t\.me\/|https?:\/\/)?([a-zA-Z0-9_]{5,})', update.message.text)
-    channels = list(set([get_clean_id(p) for p in potential if get_clean_id(p)]))
+    channels = list(set([p.split('/')[-1].replace('@', '').strip() for p in potential]))
 
     if not channels:
-        await update.message.reply_text("Каналы не найдены в сообщении.")
+        await update.message.reply_text("Пришли ссылку на канал или @username.")
         return
 
-    status_msg = await update.message.reply_text(f"🔎 Начинаю проверку {len(channels)} каналов...")
+    msg = await update.message.reply_text(f"⌛ Проверяю: {', '.join(channels)}...")
     results = []
 
-    for idx, channel in enumerate(channels, 1):
-        # 1. Сначала Telemetr
-        state, report = await check_telemetr(channel)
-        
+    for c in channels:
+        state, report = await check_telemetr(c)
         if state == "CLEAN":
-            # 2. Если Telemetr ок, проверяем в TGStat
-            final_report = await check_tgstat(channel)
-            results.append(final_report)
+            results.append(await check_tgstat(c))
         else:
             results.append(report)
-        
-        # Обновляем статус каждые 2 канала (чтобы не спамить в API Telegram)
-        if idx % 2 == 0 or idx == len(channels):
-            text = f"⏳ Прогресс: {idx}/{len(channels)}\n\n" + "\n".join(results)
-            try:
-                await status_msg.edit_text(text)
-            except: pass
-        
-        await asyncio.sleep(1.5) # Пауза для стабильности
+    
+    await msg.edit_text("\n".join(results))
 
 if __name__ == '__main__':
     if not TOKEN:
+        logger.error("BOT_TOKEN IS MISSING!")
         exit(1)
-        
+
     app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     
-    print("Бот запущен и готов к работе...")
-    # drop_pending_updates=True критически важен после простоев!
+    # Обрабатываем ВООБЩЕ ВСЕ текстовые сообщения
+    app.add_handler(MessageHandler(filters.ALL, handle_any_message))
+    
+    logger.info("Бот запущен. Удаляю вебхуки...")
     app.run_polling(drop_pending_updates=True)
