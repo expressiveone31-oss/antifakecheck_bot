@@ -22,49 +22,54 @@ def get_clean_id(channel_input):
     return clean
 
 async def check_telemetr(channel_id):
+    """Легкая проверка Telemetr"""
     url = "https://api.telemetr.me/channels/get"
     headers = {"Authorization": f"Bearer {TELEMETR_TOKEN}"}
     try:
-        # Пытаемся сделать запрос с таймаутом побольше
-        r = requests.get(url, headers=headers, params={"channelId": channel_id}, timeout=15)
+        r = requests.get(url, headers=headers, params={"channelId": channel_id}, timeout=10)
         if r.status_code == 200:
             data = r.json().get('response', {})
             if data.get('is_fake') or data.get('restrictions'):
                 return "FRAUD", f"🚩 @{channel_id}: ФРОД (Telemetr)"
             return "CLEAN", None
-        elif r.status_code == 429:
-            return "RETRY", "⚠️ Пауза (Лимит API)"
-        return "ERROR", f"⚠️ @{channel_id}: Ошибка API ({r.status_code})"
+        return "SKIP", None # Если Телеметр тупит, просто идем к ТГСтату
     except:
-        return "ERROR", f"❌ @{channel_id}: Ошибка связи"
+        return "SKIP", None
 
 async def check_tgstat(channel_id):
-    url = "https://api.tgstat.ru/channels/get"
+    """Легкая проверка через stat, но с поиском меток фрода"""
+    # Используем stat вместо get — это быстрее и стабильнее
+    url = "https://api.tgstat.ru/channels/stat"
     params = {"token": TGSTAT_TOKEN, "channelId": channel_id}
     try:
-        r = requests.get(url, params=params, timeout=15)
+        r = requests.get(url, params=params, timeout=10)
         if r.status_code == 200:
             data = r.json()
             ch_info = data.get('response', {})
+            
+            # ТА САМАЯ ПРОВЕРКА ИЗ ПОДДЕРЖКИ
+            # Ищем внутри объекта stat данные об ограничениях
             restrictions = ch_info.get('tgstat_restrictions', {})
             
-            if restrictions.get('red_label') is True:
-                return f"🚩 @{channel_id}: ФРОД (TGStat: метка)"
+            if restrictions.get('red_label') is True or ch_info.get('red_label') == 1:
+                return f"🚩 @{channel_id}: ФРОД (TGStat)"
+            
             if restrictions.get('black_label') is True:
                 return f"🚩 @{channel_id}: МОШЕННИЧЕСТВО (TGStat)"
+            
             return f"✅ @{channel_id}: Чисто"
-        elif r.status_code == 429:
-            return "⚠️ Лимит запросов (TGStat)"
-        return f"⚠️ @{channel_id}: Ошибка API ({r.status_code})"
+        
+        return f"⚠️ @{channel_id}: Ошибка API ТГСтат"
     except:
         return f"❌ @{channel_id}: Ошибка связи"
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Бот в строю! Кидай список каналов.")
+    await update.message.reply_text("Бот готов! Присылай список каналов.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.text or update.message.text.startswith('/'): return
     
+    # Собираем юзернеймы
     raw_found = re.findall(r'(?:@|t\.me\/|https?:\/\/)?([a-zA-Z0-9_]{4,})', update.message.text)
     channels = []
     for p in raw_found:
@@ -72,33 +77,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if cid and cid not in channels: channels.append(cid)
 
     if not channels:
-        await update.message.reply_text("Каналы не найдены.")
+        await update.message.reply_text("Не нашел каналов.")
         return
 
-    status_msg = await update.message.reply_text(f"🔎 Проверяю {len(channels)} каналов...")
+    status_msg = await update.message.reply_text(f"🔎 Проверяю {len(channels)}...")
     results = []
 
     for c in channels:
+        # Сначала Телеметр (если упал — не страшно)
         state, report = await check_telemetr(c)
         
-        # Если словили лимит, ждем чуть дольше и идем дальше
-        if state == "RETRY":
-            await asyncio.sleep(3)
-            state, report = await check_telemetr(c)
-
-        if state == "CLEAN":
-            final_report = await check_tgstat(c)
-            results.append(final_report)
-        else:
+        if state == "FRAUD":
             results.append(report)
+        else:
+            # Если Телеметр сказал 'Чисто' или 'Ошибка', проверяем в ТГСтат
+            results.append(await check_tgstat(c))
         
-        progress_text = f"⏳ Прогресс: {len(results)}/{len(channels)}\n\n" + "\n".join(results)
+        # Обновляем сообщение
+        progress = f"⏳ Готово: {len(results)}/{len(channels)}\n\n" + "\n".join(results)
         try:
-            await status_msg.edit_text(progress_text)
+            await status_msg.edit_text(progress)
         except: pass
         
-        # Увеличиваем паузу между каналами до 2 секунд для стабильности
-        await asyncio.sleep(2.0)
+        # Минимальная пауза, чтобы не ловить блокировки
+        await asyncio.sleep(1.0)
 
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TOKEN).build()
